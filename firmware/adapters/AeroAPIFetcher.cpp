@@ -87,6 +87,7 @@ bool AeroAPIFetcher::fetchFlightInfo(const String &flightIdent, FlightInfo &outI
 
     DynamicJsonDocument doc(16384);
     DeserializationError err = deserializeJson(doc, payload);
+    payload = String(); // free ~25 KB before extracting fields from doc
     if (err)
     {
         Serial.printf("AeroAPIFetcher: JSON parsing failed for flight %s: %s\n", flightIdent.c_str(), err.c_str());

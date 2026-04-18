@@ -144,17 +144,37 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
             if (chunkSize == 0)
                 break; // terminal zero-length chunk
 
+            // Pre-reserve space for this whole chunk before reading a single byte.
+            // Without this, String::operator+= doubles its buffer on each overflow,
+            // fragmenting the SAMD51 heap severely after several fetch cycles.
+            {
+                size_t available = maxBodyBytes - outPayload.length();
+                size_t toReserve = (chunkSize < available) ? (size_t)chunkSize : available;
+                outPayload.reserve(outPayload.length() + toReserve);
+            }
+
             unsigned long read = 0;
             unsigned long chunkTimeout = millis() + 10000UL;
+            // +1 so we can null-terminate for String::operator+= (JSON is ASCII, no embedded nulls)
+            char buf[65];
             while (read < chunkSize)
             {
                 if (outPayload.length() >= maxBodyBytes)
                     break; // body limit reached mid-chunk
                 if (client.available())
                 {
-                    outPayload += (char)client.read();
-                    read++;
-                    chunkTimeout = millis() + 5000UL;
+                    size_t canRead = (size_t)(chunkSize - read);
+                    if (canRead > (sizeof(buf) - 1)) canRead = sizeof(buf) - 1;
+                    size_t space = maxBodyBytes - outPayload.length();
+                    if (canRead > space) canRead = space;
+                    int n = client.read((uint8_t *)buf, canRead);
+                    if (n > 0)
+                    {
+                        buf[n] = '\0';
+                        outPayload += buf;
+                        read += (unsigned long)n;
+                        chunkTimeout = millis() + 5000UL;
+                    }
                 }
                 else if (millis() > chunkTimeout)
                 {
@@ -174,12 +194,22 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
     {
         // Non-chunked: read raw body until connection closes or limit reached
         unsigned long bodyTimeout = millis() + 15000UL;
+        // +1 so we can null-terminate for String::operator+= (JSON is ASCII, no embedded nulls)
+        char buf[65];
         while (client.connected() || client.available())
         {
-            while (client.available() && outPayload.length() < maxBodyBytes)
+            if (client.available() && outPayload.length() < maxBodyBytes)
             {
-                outPayload += (char)client.read();
-                bodyTimeout = millis() + 5000UL;
+                size_t canRead = sizeof(buf) - 1;
+                size_t space = maxBodyBytes - outPayload.length();
+                if (canRead > space) canRead = space;
+                int n = client.read((uint8_t *)buf, canRead);
+                if (n > 0)
+                {
+                    buf[n] = '\0';
+                    outPayload += buf;
+                    bodyTimeout = millis() + 5000UL;
+                }
             }
             if (outPayload.length() >= maxBodyBytes || millis() > bodyTimeout)
                 break;

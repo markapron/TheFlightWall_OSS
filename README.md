@@ -10,15 +10,25 @@ This is the open source version with some basic guides to the panels, mounting t
 *Airline logo lookup will be added soon!*
 
 # Component List
+
+## Option A — Adafruit Matrix Portal M4 (recommended for new builds)
+
+The simplest all-in-one controller. Built-in WiFi (AirLift ESP32 co-processor), USB-C power, and a direct HUB75 connector — no level shifter, no wiring to the data pin.
+
 - Main components
-    - 20x [16x16 LED panels](https://www.aliexpress.us/item/2255800358269772.html)
-    - ESP32 dev board (we used the [R32 D1](https://www.amazon.com/HiLetgo-ESP-32-Development-Bluetooth-Arduino/dp/B07WFZCBH8) but any ESP dev board should work)
+    - [Adafruit Matrix Portal M4 Starter Kit](https://www.adafruit.com/product/4812) — SAMD51 + AirLift WiFi, 64 X 32 RGB Matrix, LED Diffusion Acrylic, Adhesive Squares, 5V Power Supply
+
+## Option B — ESP32 dev board (original build)
+
+- Main components
+    - 20x [16x16 WS2812B NeoPixel panels](https://www.aliexpress.us/item/2255800358269772.html)
+    - ESP32 dev board (we used the [R32 D1](https://www.amazon.com/HiLetgo-ESP-32-Development-Bluetooth-Arduino/dp/B07WFZCBH8) but any ESP32 should work)
     - 3D printed brackets (or MDF / cardboard)
     - 2x 6ft wooden trim pieces (for support)
 - Power
     - [5V >20A power supply](https://www.amazon.com/dp/B07KC55TJF) (for 20 panels)
     - [3.3V - 5V voltage level shifter](https://www.amazon.com/dp/B07F7W91LC)
-- Data
+- Data (both options)
     - [OpenSky](https://opensky-network.org/) for ADS-B flight data
     - [FlightAware AeroAPI](https://www.flightaware.com/commercial/aeroapi/) for route, aircraft, and airline information
 
@@ -83,7 +93,7 @@ Set your location to track flights by updating the following values in [UserConf
 
 ### Build and flash with PlatformIO
 
-The firmware can be built and uploaded to the ESP32 using [PlatformIO](https://platformio.org/)
+The firmware supports two hardware targets and is built using [PlatformIO](https://platformio.org/).
 
 1. **Install PlatformIO**: 
    - Install [VS Code](https://code.visualstudio.com/)
@@ -93,15 +103,26 @@ The firmware can be built and uploaded to the ESP32 using [PlatformIO](https://p
    - Add your API keys to [APIConfiguration.h](firmware/config/APIConfiguration.h)
    - Add your WiFi credentials to [WiFiConfiguration.h](firmware/config/WiFiConfiguration.h)
    - Set your location (and optional display preferences) in [UserConfiguration.h](firmware/config/UserConfiguration.h)
-   - Adjust display hardware (pin, tile layout) in [HardwareConfiguration.h](firmware/config/HardwareConfiguration.h)
+   - Adjust display hardware dimensions in [HardwareConfiguration.h](firmware/config/HardwareConfiguration.h) if needed
 
 3. **Build and upload**:
    - Open the `firmware` folder in PlatformIO
-   - Connect your ESP32 via USB
-   - Click the "Upload" button (→) in the PlatformIO toolbar
+   - Connect your board via USB
+   - Select the correct environment and click Upload (→)
+
+| Board | PlatformIO environment | Display type |
+|---|---|---|
+| Adafruit Matrix Portal M4 | `adafruit_matrix_portal_m4` | HUB75 RGB matrix via Adafruit Protomatter |
+| ESP32 dev board | `esp32dev` | WS2812B NeoPixel matrix via FastLED NeoMatrix |
 
 ### Customization
 
+- **Max flights shown per cycle**: Caps AeroAPI requests per refresh (stays within rate limits)
+  - Edit `MAX_ENRICHED_FLIGHTS` in [UserConfiguration.h](firmware/config/UserConfiguration.h)
+- **Fetch interval**: How often new flight data is pulled from OpenSky and AeroAPI
+  - Edit `FETCH_INTERVAL_SECONDS` in [TimingConfiguration.h](firmware/config/TimingConfiguration.h)
+- **Display cycling speed**: How long each flight card is shown before advancing to the next
+  - Edit `DISPLAY_CYCLE_SECONDS` in [TimingConfiguration.h](firmware/config/TimingConfiguration.h)
 - **Brightness**: Controls overall display brightness (0–255)
   - Edit `DISPLAY_BRIGHTNESS` in [UserConfiguration.h](firmware/config/UserConfiguration.h)
 - **Text color**: RGB values used for all text/borders

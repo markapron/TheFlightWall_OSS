@@ -302,10 +302,11 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
     }
 
     // The OpenSky states response is ~20-25 KB of JSON. ArduinoJson needs roughly
-    // 1.5x the raw JSON size for its internal representation. 48 KB is safe on SAMD51
-    // which has 512 KB of RAM.
+    // 1.5x the raw JSON size for its internal representation. 48 KB is safe on the
+    // SAMD51's 192 KB of RAM, provided we free the raw payload string first.
     DynamicJsonDocument doc(49152);
     DeserializationError err = deserializeJson(doc, payload);
+    payload = String(); // free ~21 KB before iterating the doc tree
     if (err)
     {
         Serial.print("OpenSkyFetcher: JSON deserialization error: ");
