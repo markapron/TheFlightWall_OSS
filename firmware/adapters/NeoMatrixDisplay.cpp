@@ -35,23 +35,23 @@ NeoMatrixDisplay::~NeoMatrixDisplay()
 
 bool NeoMatrixDisplay::initialize()
 {
-    _matrixWidth = HardwareConfiguration::DISPLAY_MATRIX_WIDTH;
-    _matrixHeight = HardwareConfiguration::DISPLAY_MATRIX_HEIGHT;
+    _matrixWidth = HardwareConfiguration::NEOMATRIX_MATRIX_WIDTH;
+    _matrixHeight = HardwareConfiguration::NEOMATRIX_MATRIX_HEIGHT;
     _numPixels = (uint32_t)_matrixWidth * (uint32_t)_matrixHeight;
 
     _leds = new CRGB[_numPixels];
 
     _matrix = new FastLED_NeoMatrix(
         _leds,
-        HardwareConfiguration::DISPLAY_TILE_PIXEL_W,
-        HardwareConfiguration::DISPLAY_TILE_PIXEL_H,
-        HardwareConfiguration::DISPLAY_TILES_X,
-        HardwareConfiguration::DISPLAY_TILES_Y,
+        HardwareConfiguration::NEOMATRIX_TILE_PIXEL_W,
+        HardwareConfiguration::NEOMATRIX_TILE_PIXEL_H,
+        HardwareConfiguration::NEOMATRIX_TILES_X,
+        HardwareConfiguration::NEOMATRIX_TILES_Y,
         NEO_MATRIX_BOTTOM + NEO_MATRIX_RIGHT +
             NEO_MATRIX_COLUMNS + NEO_MATRIX_ZIGZAG +
             NEO_TILE_TOP + NEO_TILE_RIGHT + NEO_TILE_COLUMNS + NEO_TILE_ZIGZAG);
 
-    FastLED.addLeds<WS2812B, HardwareConfiguration::DISPLAY_PIN, GRB>(_leds, _numPixels);
+    FastLED.addLeds<WS2812B, HardwareConfiguration::NEOMATRIX_DATA_PIN, GRB>(_leds, _numPixels);
     _matrix->setTextWrap(false);
     _matrix->setTextSize(1);
     _matrix->setBrightness(UserConfiguration::DISPLAY_BRIGHTNESS);

@@ -28,39 +28,39 @@ size_t FlightDataFetcher::fetchFlights(std::vector<StateVector> &outStates,
     if (!ok)
         return 0;
 
+    // State vectors are already sorted by distance. Enrich only the closest
+    // MAX_ENRICHED_FLIGHTS flights with a callsign to stay within AeroAPI rate limits.
     size_t enriched = 0;
     for (const StateVector &s : outStates)
     {
+        if (enriched >= UserConfiguration::MAX_ENRICHED_FLIGHTS)
+            break;
+
         if (s.callsign.length() == 0)
-        {
             continue;
-        }
+
         FlightInfo info;
-        if (_flightFetcher->fetchFlightInfo(s.callsign, info))
+        if (!_flightFetcher->fetchFlightInfo(s.callsign, info))
+            continue;
+
+        FlightWallFetcher fw;
+        if (info.operator_icao.length())
         {
-            FlightWallFetcher fw;
-            if (info.operator_icao.length())
-            {
-                String airlineFull;
-                if (fw.getAirlineName(info.operator_icao, airlineFull))
-                {
-                    info.airline_display_name_full = airlineFull;
-                }
-            }
-            if (info.aircraft_code.length())
-            {
-                String aircraftShort, aircraftFull;
-                if (fw.getAircraftName(info.aircraft_code, aircraftShort, aircraftFull))
-                {
-                    if (aircraftShort.length())
-                    {
-                        info.aircraft_display_name_short = aircraftShort;
-                    }
-                }
-            }
-            outFlights.push_back(info);
-            enriched++;
+            String airlineFull;
+            if (fw.getAirlineName(info.operator_icao, airlineFull))
+                info.airline_display_name_full = airlineFull;
         }
+        if (info.aircraft_code.length())
+        {
+            String aircraftShort, aircraftFull;
+            if (fw.getAircraftName(info.aircraft_code, aircraftShort, aircraftFull))
+            {
+                if (aircraftShort.length())
+                    info.aircraft_display_name_short = aircraftShort;
+            }
+        }
+        outFlights.push_back(info);
+        enriched++;
     }
     return enriched;
 }
