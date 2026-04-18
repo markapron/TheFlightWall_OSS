@@ -16,6 +16,11 @@ namespace HardwareConfiguration
     static const uint8_t HUB75_LAT_PIN = 15;
     static const uint8_t HUB75_OE_PIN = 16;
 
+    // --- Matrix Portal M4 user buttons ---
+    // Both buttons are active LOW; configure with INPUT_PULLUP.
+    static const uint8_t BUTTON_UP_PIN   = 2; // PA02
+    static const uint8_t BUTTON_DOWN_PIN = 3; // PA15
+
     // --- NeoPixel matrix (ESP32 / FastLED NeoMatrix) ---
     // These are not used on Matrix Portal M4's HUB75 output, but kept so the ESP32 build can
     // target a WS2812/NeoPixel-style matrix using the existing NeoMatrixDisplay adapter.

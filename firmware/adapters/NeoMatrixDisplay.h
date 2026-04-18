@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <vector>
 #include "interfaces/BaseDisplay.h"
+#include "models/TailFlightStatus.h"
 
 class FastLED_NeoMatrix;
 struct CRGB;
@@ -16,6 +17,9 @@ public:
     bool initialize() override;
     void clear() override;
     void displayFlights(const std::vector<FlightInfo> &flights) override;
+    void displayTailTracker(const TailFlightStatus &) {} // stub — not implemented on ESP32
+    void displayTailLoading() {}                         // stub — not implemented on ESP32
+
     void displayMessage(const String &message);
     void showLoading();
 

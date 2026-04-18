@@ -130,9 +130,7 @@ String ProtomatterDisplay::truncateToColumns(const String &text, int maxColumns)
 {
     if ((int)text.length() <= maxColumns)
         return text;
-    if (maxColumns <= 3)
-        return text.substring(0, maxColumns);
-    return text.substring(0, maxColumns - 3) + String("...");
+    return text.substring(0, maxColumns);
 }
 
 void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
@@ -272,6 +270,157 @@ void ProtomatterDisplay::displayMessage(const String &message)
 void ProtomatterDisplay::showLoading()
 {
     displayLoadingScreen();
+}
+
+// ---------------------------------------------------------------------------
+// Tail tracker display
+// ---------------------------------------------------------------------------
+
+// Format a duration in seconds as a compact string, e.g. "1h 23m" or "45m".
+static String formatDuration(unsigned long seconds)
+{
+    if (seconds < 60) return String("0m");
+    unsigned long mins  = seconds / 60;
+    unsigned long hours = mins / 60;
+    unsigned long rmins = mins % 60;
+    if (hours == 0) return String(mins) + String("m");
+    // For very long flights drop minutes to keep the string short (≤8 chars).
+    if (hours >= 10) return String(hours) + String("h");
+    return String(hours) + String("h ") + String(rmins) + String("m");
+}
+
+// Format elapsed time as seen on the tail tracker:
+//   airborne → "1h 23m"   (status line already says En Route)
+//   landed   → "1h 23m ago" or "10h ago"
+static String formatElapsed(unsigned long seconds, bool landed)
+{
+    unsigned long mins  = seconds / 60;
+    unsigned long hours = mins / 60;
+    unsigned long rmins = mins % 60;
+
+    if (landed)
+    {
+        if (hours == 0)   return String(mins) + String("m ago");      // "45m ago"
+        if (hours < 10)   return String(hours) + String("h ")
+                               + String(rmins) + String("m ago");     // "2h 5m ago"
+        return String(hours) + String("h ago");                       // "12h ago"
+    }
+    return formatDuration(seconds);
+}
+
+void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
+{
+    if (_matrix == nullptr) return;
+
+    _matrix->fillScreen(0);
+
+    // Use the full panel width with no left border so we get 10 char columns
+    // (64 px / 6 px per char = 10).  This gives a clean data-dense look that
+    // is visually distinct from the bordered nearby-flights card.
+    const int charWidth  = 6;
+    const int maxCols    = _matrixWidth / charWidth; // 10
+    const int16_t startX = 0;
+
+    // Compute current epoch from the cached snapshot so we do not need to
+    // query WiFi.getTime() on every display frame.
+    unsigned long currentEpoch = status.fetch_epoch
+                               + (millis() - status.fetch_millis) / 1000UL;
+
+    // Hard-clip helper: cut at maxCols with no ellipsis so every character
+    // up to the panel edge is shown rather than sacrificing 3 chars to "...".
+    auto clip = [](const String &s, int cols) -> String {
+        return ((int)s.length() <= cols) ? s : s.substring(0, cols);
+    };
+
+    // --- Line 1: status string (append destination code when landed) ---
+    String statusLine = status.status.length() > 0 ? status.status : String("No Data");
+    if (status.actual_on_epoch > 0 && status.dest_code.length() > 0)
+        statusLine = statusLine + String(" ") + status.dest_code;
+    statusLine = clip(statusLine, maxCols);
+
+    // --- Line 2: elapsed time or ground state ---
+    String timeLine;
+    bool isLanded   = status.actual_on_epoch  > 0;
+    bool isAirborne = status.actual_off_epoch > 0 && !isLanded;
+
+    if (isLanded && currentEpoch >= status.actual_on_epoch)
+    {
+        timeLine = formatElapsed(currentEpoch - status.actual_on_epoch, true);
+    }
+    else if (isAirborne && currentEpoch >= status.actual_off_epoch)
+    {
+        timeLine = formatElapsed(currentEpoch - status.actual_off_epoch, false);
+    }
+    else
+    {
+        timeLine = String("Preparing");
+    }
+    timeLine = clip(timeLine, maxCols);
+
+    // --- Line 3: city / region ---
+    String locLine;
+    if (status.city.length() > 0 && status.region.length() > 0)
+        locLine = status.city + String(" ") + status.region;
+    else if (status.city.length() > 0)
+        locLine = status.city;
+    else if (status.region.length() > 0)
+        locLine = status.region;
+    else
+        locLine = String("---");
+    locLine = clip(locLine, maxCols);
+
+    // Text color matches user config; use amber for the time line to add contrast.
+    const uint16_t textColor    = colorWithBrightness(_matrix,
+                                                      UserConfiguration::TEXT_COLOR_R,
+                                                      UserConfiguration::TEXT_COLOR_G,
+                                                      UserConfiguration::TEXT_COLOR_B);
+    const uint16_t timeColor    = colorWithBrightness(_matrix, 255, 200,  50);
+    const uint16_t timeDimColor = colorWithBrightness(_matrix, 130, 100,  25); // dim "h"/"m"
+    const uint16_t locColor     = colorWithBrightness(_matrix, 150, 220, 255);
+
+    drawTextLine(startX,  1, statusLine, textColor);
+
+    // Draw the time line character by character so the unit letters "h" and "m"
+    // are rendered dimmer than the numeric digits.
+    _matrix->setCursor(startX, 10);
+    for (size_t i = 0; i < (size_t)timeLine.length(); ++i)
+    {
+        const char c = timeLine[i];
+        _matrix->setTextColor((c >= '0' && c <= '9') ? timeColor : timeDimColor);
+        _matrix->write(c);
+    }
+
+    drawTextLine(startX, 19, locLine,    locColor);
+
+    // --- Progress bar (bottom 2 rows) ---
+    // Background: very dim grey stripe across the full width.
+    const uint16_t barBg = _matrix->color565(20, 20, 20);
+    const uint16_t barFg = colorWithBrightness(_matrix, 0, 220, 0); // green
+    _matrix->fillRect(0, 30, (int16_t)_matrixWidth, 2, barBg);
+
+    int fillW = ((int)status.progress_percent * (int)_matrixWidth) / 100;
+    if (fillW > (int)_matrixWidth) fillW = (int)_matrixWidth;
+    if (fillW > 0)
+        _matrix->fillRect(0, 30, (int16_t)fillW, 2, barFg);
+
+    _matrix->show();
+}
+
+void ProtomatterDisplay::displayTailLoading()
+{
+    if (_matrix == nullptr) return;
+
+    _matrix->fillScreen(0);
+
+    const uint16_t color = colorWithBrightness(_matrix, 255, 200, 50); // amber
+    const String   text  = "Tracking";
+    const int      charWidth  = 6;
+    const int      charHeight = 8;
+    const int16_t  x = ((int16_t)_matrixWidth  - (int16_t)(text.length() * charWidth))  / 2;
+    const int16_t  y = ((int16_t)_matrixHeight - charHeight) / 2 - 2;
+
+    drawTextLine(x, y, text, color);
+    _matrix->show();
 }
 
 #endif // FLIGHTWALL_DISPLAY_PROTOMATTER

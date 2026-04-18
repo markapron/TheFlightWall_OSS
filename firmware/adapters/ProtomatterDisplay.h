@@ -4,6 +4,7 @@
 #include <vector>
 #include <Arduino.h>
 #include "interfaces/BaseDisplay.h"
+#include "models/TailFlightStatus.h"
 
 #if defined(FLIGHTWALL_DISPLAY_PROTOMATTER)
 class Adafruit_Protomatter;
@@ -17,6 +18,10 @@ public:
     bool initialize() override;
     void clear() override;
     void displayFlights(const std::vector<FlightInfo> &flights) override;
+
+    // Tail tracker mode display.
+    void displayTailTracker(const TailFlightStatus &status);
+    void displayTailLoading();
 
     void displayMessage(const String &message);
     void showLoading();
@@ -43,6 +48,8 @@ public:
     bool initialize() override { return false; }
     void clear() override {}
     void displayFlights(const std::vector<FlightInfo> &) override {}
+    void displayTailTracker(const TailFlightStatus &) {}
+    void displayTailLoading() {}
     void displayMessage(const String &) {}
     void showLoading() {}
 };
