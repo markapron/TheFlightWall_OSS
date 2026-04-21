@@ -13,7 +13,7 @@ Output: Populates FlightInfo on success and returns true.
 
 static String safeGetString(JsonVariant v, const char *key)
 {
-    if (!v.containsKey(key) || v[key].isNull())
+    if (v[key].isNull())
         return String("");
     return String(v[key].as<const char *>());
 }
@@ -85,7 +85,7 @@ bool AeroAPIFetcher::fetchFlightInfo(const String &flightIdent, FlightInfo &outI
         return false;
     }
 
-    DynamicJsonDocument doc(16384);
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
     payload = String(); // free ~25 KB before extracting fields from doc
     if (err)
@@ -110,16 +110,18 @@ bool AeroAPIFetcher::fetchFlightInfo(const String &flightIdent, FlightInfo &outI
     outInfo.operator_iata = safeGetString(f, "operator_iata");
     outInfo.aircraft_code = safeGetString(f, "aircraft_type");
 
-    if (f.containsKey("origin") && f["origin"].is<JsonObject>())
+    if (!f["origin"].isNull() && f["origin"].is<JsonObject>())
     {
         JsonObject o = f["origin"].as<JsonObject>();
         outInfo.origin.code_icao = safeGetString(o, "code_icao");
+        outInfo.origin.code_iata = safeGetString(o, "code_iata");
     }
 
-    if (f.containsKey("destination") && f["destination"].is<JsonObject>())
+    if (!f["destination"].isNull() && f["destination"].is<JsonObject>())
     {
         JsonObject d = f["destination"].as<JsonObject>();
         outInfo.destination.code_icao = safeGetString(d, "code_icao");
+        outInfo.destination.code_iata = safeGetString(d, "code_iata");
     }
 
     return true;

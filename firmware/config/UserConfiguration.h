@@ -14,12 +14,7 @@ namespace UserConfiguration
     // per-minute rate limits, so keep this at 3-5.
     static const size_t MAX_ENRICHED_FLIGHTS = 3;
 
-    // Display customization
-    // Brightness controls overall display brightness (0-255)
+    // Overall display brightness (0-255).
+    // Per-element colors are configured in config/DisplayConfiguration.h.
     static const uint8_t DISPLAY_BRIGHTNESS = 64;
-
-    // RGB color for all text rendering on the LED matrix
-    static const uint8_t TEXT_COLOR_R = 255;
-    static const uint8_t TEXT_COLOR_G = 255;
-    static const uint8_t TEXT_COLOR_B = 255;
 }

@@ -16,6 +16,7 @@ Outputs: Visual output to LED matrix using FastLED.
 #include "config/UserConfiguration.h"
 #include "config/HardwareConfiguration.h"
 #include "config/TimingConfiguration.h"
+#include "config/DisplayConfiguration.h"
 
 NeoMatrixDisplay::NeoMatrixDisplay() {}
 
@@ -78,8 +79,8 @@ String NeoMatrixDisplay::makeFlightLine(const FlightInfo &f)
     {
         airline = f.operator_code;
     }
-    String origin = f.origin.code_icao;
-    String dest = f.destination.code_icao;
+    String origin = f.origin.code_iata.length() ? f.origin.code_iata : f.origin.code_icao;
+    String dest   = f.destination.code_iata.length() ? f.destination.code_iata : f.destination.code_icao;
     String route = origin + "-" + dest;
     String type = f.aircraft_display_name_short.length() ? f.aircraft_display_name_short : f.aircraft_code;
     String ident = f.ident.length() ? f.ident : f.ident_icao;
@@ -124,52 +125,98 @@ String NeoMatrixDisplay::truncateToColumns(const String &text, int maxColumns)
 void NeoMatrixDisplay::displaySingleFlightCard(const FlightInfo &f)
 {
     // Border
-    const uint16_t borderColor = _matrix->Color(UserConfiguration::TEXT_COLOR_R,
-                                                UserConfiguration::TEXT_COLOR_G,
-                                                UserConfiguration::TEXT_COLOR_B);
+    const uint16_t borderColor = _matrix->Color(DisplayConfiguration::NEARBY_BORDER_R,
+                                                DisplayConfiguration::NEARBY_BORDER_G,
+                                                DisplayConfiguration::NEARBY_BORDER_B);
     _matrix->drawRect(0, 0, _matrixWidth, _matrixHeight, borderColor);
 
-    // Calculate columns for 6x8 default font (5x7 glyphs + 1px spacing)
     const int charWidth = 6;
     const int charHeight = 8;
-    const int padding = 2;                                   // Small padding from border
-    const int innerWidth = _matrixWidth - 2 - (2 * padding); // Account for border and padding
+    const int padding = 2;
+    const int innerWidth = _matrixWidth - 2 - (2 * padding);
     const int innerHeight = _matrixHeight - 2 - (2 * padding);
     const int maxCols = innerWidth / charWidth;
 
-    // Lines per display:
-    // 1: airline
-    // 2: route
-    // 3: aircraft
-
+    // Line 1: airline / operator name
     String airline = f.airline_display_name_full.length() ? f.airline_display_name_full
                                                           : (f.operator_iata.length() ? f.operator_iata : (f.operator_icao.length() ? f.operator_icao : f.operator_code));
-
-    String origin = f.origin.code_icao;
-    String dest = f.destination.code_icao;
-    String line2 = origin + String(">") + dest;
-
-    String line3 = f.aircraft_display_name_short.length() ? f.aircraft_display_name_short : f.aircraft_code;
-
     String line1 = truncateToColumns(airline, maxCols);
-    line2 = truncateToColumns(line2, maxCols);
+
+    // Line 2: route — ICAO with first char dim, remaining chars bright.
+    // Falls back to all-bright IATA when no ICAO is available.
+    const String &origIcao = f.origin.code_icao;
+    const String &origIata = f.origin.code_iata;
+    const String &dstIcao  = f.destination.code_icao;
+    const String &dstIata  = f.destination.code_iata;
+
+    // Line 3: aircraft type
+    String line3 = f.aircraft_display_name_short.length() ? f.aircraft_display_name_short : f.aircraft_code;
     line3 = truncateToColumns(line3, maxCols);
 
-    const uint16_t textColor = _matrix->Color(UserConfiguration::TEXT_COLOR_R,
-                                              UserConfiguration::TEXT_COLOR_G,
-                                              UserConfiguration::TEXT_COLOR_B);
+    // Colors
+    const uint16_t line1Color = _matrix->Color(DisplayConfiguration::NEARBY_LINE1_R,
+                                               DisplayConfiguration::NEARBY_LINE1_G,
+                                               DisplayConfiguration::NEARBY_LINE1_B);
+    const uint16_t iataColor  = _matrix->Color(DisplayConfiguration::NEARBY_LINE2_IATA_R,
+                                               DisplayConfiguration::NEARBY_LINE2_IATA_G,
+                                               DisplayConfiguration::NEARBY_LINE2_IATA_B);
+    const uint16_t icaoColor  = _matrix->Color(DisplayConfiguration::NEARBY_LINE2_ICAO_R,
+                                               DisplayConfiguration::NEARBY_LINE2_ICAO_G,
+                                               DisplayConfiguration::NEARBY_LINE2_ICAO_B);
+    const uint16_t sepColor   = _matrix->Color(DisplayConfiguration::NEARBY_LINE2_SEP_R,
+                                               DisplayConfiguration::NEARBY_LINE2_SEP_G,
+                                               DisplayConfiguration::NEARBY_LINE2_SEP_B);
+    const uint16_t line3Color = _matrix->Color(DisplayConfiguration::NEARBY_LINE3_R,
+                                               DisplayConfiguration::NEARBY_LINE3_G,
+                                               DisplayConfiguration::NEARBY_LINE3_B);
+
     const int lineCount = 3;
-    const int lineSpacing = 1; // 1px spacing between lines
+    const int lineSpacing = 1;
     const int totalTextHeight = lineCount * charHeight + (lineCount - 1) * lineSpacing;
-    const int topOffset = 1 + padding + (innerHeight - totalTextHeight) / 2; // center inside border with padding
-    const int16_t startX = 1 + padding;                                      // left padding inside border
+    const int topOffset = 1 + padding + (innerHeight - totalTextHeight) / 2;
+    const int16_t startX = 1 + padding;
 
     int16_t y = topOffset;
-    drawTextLine(startX, y, line1, textColor);
+
+    // Line 1
+    drawTextLine(startX, y, line1, line1Color);
     y += charHeight + lineSpacing;
-    drawTextLine(startX, y, line2, textColor);
+
+    // Draw one airport code: ICAO with first char dim, rest bright.
+    // Falls back to all-bright IATA when ICAO is absent.
+    auto drawAirport = [&](const String &icao, const String &iata, int &colsUsed)
+    {
+        const String &code = icao.length() ? icao : iata;
+        if (code.length() == 0)
+            return;
+
+        const bool useIcao = icao.length() > 0;
+        for (size_t i = 0; i < code.length() && colsUsed < maxCols; ++i, ++colsUsed)
+        {
+            _matrix->setTextColor((useIcao && i == 0) ? icaoColor : iataColor);
+            _matrix->write(code[i]);
+        }
+    };
+
+    {
+        _matrix->setCursor(startX, y);
+        int colsUsed = 0;
+
+        drawAirport(origIcao, origIata, colsUsed);
+
+        if (colsUsed < maxCols)
+        {
+            _matrix->setTextColor(sepColor);
+            _matrix->write('>');
+            ++colsUsed;
+        }
+
+        drawAirport(dstIcao, dstIata, colsUsed);
+    }
     y += charHeight + lineSpacing;
-    drawTextLine(startX, y, line3, textColor);
+
+    // Line 3
+    drawTextLine(startX, y, line3, line3Color);
 }
 
 void NeoMatrixDisplay::displayFlights(const std::vector<FlightInfo> &flights)
@@ -215,7 +262,9 @@ void NeoMatrixDisplay::displayLoadingScreen()
 
     _matrix->fillScreen(0);
 
-    const uint16_t borderColor = _matrix->Color(255, 255, 255);
+    const uint16_t borderColor = _matrix->Color(DisplayConfiguration::NEARBY_BORDER_R,
+                                                DisplayConfiguration::NEARBY_BORDER_G,
+                                                DisplayConfiguration::NEARBY_BORDER_B);
     _matrix->drawRect(0, 0, _matrixWidth, _matrixHeight, borderColor);
 
     const int charWidth = 6;
@@ -226,9 +275,9 @@ void NeoMatrixDisplay::displayLoadingScreen()
     const int16_t x = (_matrixWidth - textWidth) / 2;
     const int16_t y = (_matrixHeight - charHeight) / 2 - 2;
 
-    const uint16_t textColor = _matrix->Color(UserConfiguration::TEXT_COLOR_R,
-                                              UserConfiguration::TEXT_COLOR_G,
-                                              UserConfiguration::TEXT_COLOR_B);
+    const uint16_t textColor = _matrix->Color(DisplayConfiguration::NEARBY_BORDER_R,
+                                              DisplayConfiguration::NEARBY_BORDER_G,
+                                              DisplayConfiguration::NEARBY_BORDER_B);
     drawTextLine(x, y, loadingText, textColor);
 
     FastLED.show();
@@ -244,9 +293,9 @@ void NeoMatrixDisplay::displayMessage(const String &message)
     const int charWidth = 6;
     const int charHeight = 6;
 
-    const uint16_t textColor = _matrix->Color(UserConfiguration::TEXT_COLOR_R,
-                                              UserConfiguration::TEXT_COLOR_G,
-                                              UserConfiguration::TEXT_COLOR_B);
+    const uint16_t textColor = _matrix->Color(DisplayConfiguration::NEARBY_BORDER_R,
+                                              DisplayConfiguration::NEARBY_BORDER_G,
+                                              DisplayConfiguration::NEARBY_BORDER_B);
 
     // Simple single-line message; truncate if needed
     const int innerWidth = _matrixWidth;

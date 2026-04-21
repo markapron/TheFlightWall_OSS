@@ -12,6 +12,7 @@ Responsibilities:
 #include "config/UserConfiguration.h"
 #include "config/HardwareConfiguration.h"
 #include "config/TimingConfiguration.h"
+#include "config/DisplayConfiguration.h"
 
 static uint8_t scaleByBrightness(uint8_t c)
 {
@@ -130,17 +131,15 @@ String ProtomatterDisplay::truncateToColumns(const String &text, int maxColumns)
 {
     if ((int)text.length() <= maxColumns)
         return text;
-    if (maxColumns <= 3)
-        return text.substring(0, maxColumns);
-    return text.substring(0, maxColumns - 3) + String("...");
+    return text.substring(0, maxColumns);
 }
 
 void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
 {
     const uint16_t borderColor = colorWithBrightness(_matrix,
-                                                     UserConfiguration::TEXT_COLOR_R,
-                                                     UserConfiguration::TEXT_COLOR_G,
-                                                     UserConfiguration::TEXT_COLOR_B);
+                                                     DisplayConfiguration::NEARBY_BORDER_R,
+                                                     DisplayConfiguration::NEARBY_BORDER_G,
+                                                     DisplayConfiguration::NEARBY_BORDER_B);
     _matrix->drawRect(0, 0, _matrixWidth, _matrixHeight, borderColor);
 
     const int charWidth = 6;
@@ -150,23 +149,44 @@ void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
     const int innerHeight = _matrixHeight - 2 - (2 * padding);
     const int maxCols = innerWidth / charWidth;
 
+    // Line 1: airline / operator name
     String airline = f.airline_display_name_full.length() ? f.airline_display_name_full
                                                           : (f.operator_iata.length() ? f.operator_iata : (f.operator_icao.length() ? f.operator_icao : f.operator_code));
-
-    String origin = f.origin.code_icao;
-    String dest = f.destination.code_icao;
-    String line2 = origin + String(">") + dest;
-
-    String line3 = f.aircraft_display_name_short.length() ? f.aircraft_display_name_short : f.aircraft_code;
-
     String line1 = truncateToColumns(airline, maxCols);
-    line2 = truncateToColumns(line2, maxCols);
+
+    // Line 2: route — ICAO with first char dim, remaining chars bright.
+    // Falls back to all-bright IATA when no ICAO is available.
+    const String &origIcao = f.origin.code_icao;
+    const String &origIata = f.origin.code_iata;
+    const String &dstIcao  = f.destination.code_icao;
+    const String &dstIata  = f.destination.code_iata;
+
+    // Line 3: aircraft type
+    String line3 = f.aircraft_display_name_short.length() ? f.aircraft_display_name_short : f.aircraft_code;
     line3 = truncateToColumns(line3, maxCols);
 
-    const uint16_t textColor = colorWithBrightness(_matrix,
-                                                   UserConfiguration::TEXT_COLOR_R,
-                                                   UserConfiguration::TEXT_COLOR_G,
-                                                   UserConfiguration::TEXT_COLOR_B);
+    // Colors
+    const uint16_t line1Color = colorWithBrightness(_matrix,
+                                                    DisplayConfiguration::NEARBY_LINE1_R,
+                                                    DisplayConfiguration::NEARBY_LINE1_G,
+                                                    DisplayConfiguration::NEARBY_LINE1_B);
+    const uint16_t iataColor  = colorWithBrightness(_matrix,
+                                                    DisplayConfiguration::NEARBY_LINE2_IATA_R,
+                                                    DisplayConfiguration::NEARBY_LINE2_IATA_G,
+                                                    DisplayConfiguration::NEARBY_LINE2_IATA_B);
+    const uint16_t icaoColor  = colorWithBrightness(_matrix,
+                                                    DisplayConfiguration::NEARBY_LINE2_ICAO_R,
+                                                    DisplayConfiguration::NEARBY_LINE2_ICAO_G,
+                                                    DisplayConfiguration::NEARBY_LINE2_ICAO_B);
+    const uint16_t sepColor   = colorWithBrightness(_matrix,
+                                                    DisplayConfiguration::NEARBY_LINE2_SEP_R,
+                                                    DisplayConfiguration::NEARBY_LINE2_SEP_G,
+                                                    DisplayConfiguration::NEARBY_LINE2_SEP_B);
+    const uint16_t line3Color = colorWithBrightness(_matrix,
+                                                    DisplayConfiguration::NEARBY_LINE3_R,
+                                                    DisplayConfiguration::NEARBY_LINE3_G,
+                                                    DisplayConfiguration::NEARBY_LINE3_B);
+
     const int lineCount = 3;
     const int lineSpacing = 1;
     const int totalTextHeight = lineCount * charHeight + (lineCount - 1) * lineSpacing;
@@ -174,11 +194,50 @@ void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
     const int16_t startX = 1 + padding;
 
     int16_t y = topOffset;
-    drawTextLine(startX, y, line1, textColor);
+
+    // Line 1
+    drawTextLine(startX, y, line1, line1Color);
     y += charHeight + lineSpacing;
-    drawTextLine(startX, y, line2, textColor);
+
+    // Line 2 — always show ICAO; IATA-matching chars are bright, prefix chars dim.
+    // Helper: draw one airport code, honouring the column limit.
+    // iataStart/iataEnd mark which ICAO chars overlap the IATA code (-1 = no match).
+    // Draw one airport code: ICAO with first char dim, rest bright.
+    // Falls back to all-bright IATA when ICAO is absent.
+    auto drawAirport = [&](const String &icao, const String &iata, int &colsUsed)
+    {
+        const String &code = icao.length() ? icao : iata;
+        if (code.length() == 0)
+            return;
+
+        const bool useIcao = icao.length() > 0;
+        for (size_t i = 0; i < code.length() && colsUsed < maxCols; ++i, ++colsUsed)
+        {
+            // First char of an ICAO code is the regional prefix — render it dim.
+            _matrix->setTextColor((useIcao && i == 0) ? icaoColor : iataColor);
+            _matrix->write(code[i]);
+        }
+    };
+
+    {
+        _matrix->setCursor(startX, y);
+        int colsUsed = 0;
+
+        drawAirport(origIcao, origIata, colsUsed);
+
+        if (colsUsed < maxCols)
+        {
+            _matrix->setTextColor(sepColor);
+            _matrix->write('>');
+            ++colsUsed;
+        }
+
+        drawAirport(dstIcao, dstIata, colsUsed);
+    }
     y += charHeight + lineSpacing;
-    drawTextLine(startX, y, line3, textColor);
+
+    // Line 3
+    drawTextLine(startX, y, line3, line3Color);
 }
 
 void ProtomatterDisplay::displayFlights(const std::vector<FlightInfo> &flights)
@@ -224,7 +283,10 @@ void ProtomatterDisplay::displayLoadingScreen()
 
     _matrix->fillScreen(0);
 
-    const uint16_t borderColor = colorWithBrightness(_matrix, 255, 255, 255);
+    const uint16_t borderColor = colorWithBrightness(_matrix,
+                                                     DisplayConfiguration::NEARBY_BORDER_R,
+                                                     DisplayConfiguration::NEARBY_BORDER_G,
+                                                     DisplayConfiguration::NEARBY_BORDER_B);
     _matrix->drawRect(0, 0, _matrixWidth, _matrixHeight, borderColor);
 
     const int charWidth = 6;
@@ -236,9 +298,9 @@ void ProtomatterDisplay::displayLoadingScreen()
     const int16_t y = (_matrixHeight - charHeight) / 2 - 2;
 
     const uint16_t textColor = colorWithBrightness(_matrix,
-                                                   UserConfiguration::TEXT_COLOR_R,
-                                                   UserConfiguration::TEXT_COLOR_G,
-                                                   UserConfiguration::TEXT_COLOR_B);
+                                                   DisplayConfiguration::NEARBY_BORDER_R,
+                                                   DisplayConfiguration::NEARBY_BORDER_G,
+                                                   DisplayConfiguration::NEARBY_BORDER_B);
     drawTextLine(x, y, loadingText, textColor);
 
     _matrix->show();
@@ -255,9 +317,9 @@ void ProtomatterDisplay::displayMessage(const String &message)
     const int charHeight = 6;
 
     const uint16_t textColor = colorWithBrightness(_matrix,
-                                                   UserConfiguration::TEXT_COLOR_R,
-                                                   UserConfiguration::TEXT_COLOR_G,
-                                                   UserConfiguration::TEXT_COLOR_B);
+                                                   DisplayConfiguration::NEARBY_BORDER_R,
+                                                   DisplayConfiguration::NEARBY_BORDER_G,
+                                                   DisplayConfiguration::NEARBY_BORDER_B);
 
     const int innerWidth = _matrixWidth;
     const int maxCols = innerWidth / charWidth;
@@ -272,6 +334,174 @@ void ProtomatterDisplay::displayMessage(const String &message)
 void ProtomatterDisplay::showLoading()
 {
     displayLoadingScreen();
+}
+
+// ---------------------------------------------------------------------------
+// Tail tracker display
+// ---------------------------------------------------------------------------
+
+// Format a duration in seconds as a compact string, e.g. "1h 23m" or "45m".
+static String formatDuration(unsigned long seconds)
+{
+    if (seconds < 60) return String("0m");
+    unsigned long mins  = seconds / 60;
+    unsigned long hours = mins / 60;
+    unsigned long rmins = mins % 60;
+    if (hours == 0) return String(mins) + String("m");
+    // For very long flights drop minutes to keep the string short (≤8 chars).
+    if (hours >= 10) return String(hours) + String("h");
+    return String(hours) + String("h ") + String(rmins) + String("m");
+}
+
+// Format elapsed time as seen on the tail tracker:
+//   airborne → "1h 23m"   (status line already says En Route)
+//   landed   → "1h 23m ago" or "10h ago"
+static String formatElapsed(unsigned long seconds, bool landed)
+{
+    unsigned long mins  = seconds / 60;
+    unsigned long hours = mins / 60;
+    unsigned long rmins = mins % 60;
+
+    if (landed)
+    {
+        if (hours == 0)   return String(mins) + String("m ago");      // "45m ago"
+        if (hours < 10)   return String(hours) + String("h ")
+                               + String(rmins) + String("m ago");     // "2h 5m ago"
+        return String(hours) + String("h ago");                       // "12h ago"
+    }
+    return formatDuration(seconds);
+}
+
+void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
+{
+    if (_matrix == nullptr) return;
+
+    _matrix->fillScreen(0);
+
+    // Use the full panel width with no left border so we get 10 char columns
+    // (64 px / 6 px per char = 10).  This gives a clean data-dense look that
+    // is visually distinct from the bordered nearby-flights card.
+    const int charWidth  = 6;
+    const int maxCols    = _matrixWidth / charWidth; // 10
+    const int16_t startX = 0;
+
+    // Compute current epoch from the cached snapshot so we do not need to
+    // query WiFi.getTime() on every display frame.
+    unsigned long currentEpoch = status.fetch_epoch
+                               + (millis() - status.fetch_millis) / 1000UL;
+
+    // Hard-clip helper: cut at maxCols with no ellipsis so every character
+    // up to the panel edge is shown rather than sacrificing 3 chars to "...".
+    auto clip = [](const String &s, int cols) -> String {
+        return ((int)s.length() <= cols) ? s : s.substring(0, cols);
+    };
+
+    // --- Line 1: status string (append destination code when landed) ---
+    String statusLine = status.status.length() > 0 ? status.status : String("No Data");
+    if (status.actual_on_epoch > 0 && status.dest_code.length() > 0)
+        statusLine = statusLine + String(" ") + status.dest_code;
+    statusLine = clip(statusLine, maxCols);
+
+    // --- Line 2: elapsed time or ground state ---
+    String timeLine;
+    bool isLanded   = status.actual_on_epoch  > 0;
+    bool isAirborne = status.actual_off_epoch > 0 && !isLanded;
+
+    if (isLanded && currentEpoch >= status.actual_on_epoch)
+    {
+        timeLine = formatElapsed(currentEpoch - status.actual_on_epoch, true);
+    }
+    else if (isAirborne && currentEpoch >= status.actual_off_epoch)
+    {
+        timeLine = formatElapsed(currentEpoch - status.actual_off_epoch, false);
+    }
+    else
+    {
+        timeLine = String("Preparing");
+    }
+    timeLine = clip(timeLine, maxCols);
+
+    // --- Line 3: city / region ---
+    String locLine;
+    if (status.city.length() > 0 && status.region.length() > 0)
+        locLine = status.city + String(" ") + status.region;
+    else if (status.city.length() > 0)
+        locLine = status.city;
+    else if (status.region.length() > 0)
+        locLine = status.region;
+    else
+        locLine = String("---");
+    locLine = clip(locLine, maxCols);
+
+    // Text color matches user config; use amber for the time line to add contrast.
+    const uint16_t textColor    = colorWithBrightness(_matrix,
+                                                      DisplayConfiguration::TAIL_STATUS_R,
+                                                      DisplayConfiguration::TAIL_STATUS_G,
+                                                      DisplayConfiguration::TAIL_STATUS_B);
+    const uint16_t timeColor    = colorWithBrightness(_matrix,
+                                                      DisplayConfiguration::TAIL_TIME_R,
+                                                      DisplayConfiguration::TAIL_TIME_G,
+                                                      DisplayConfiguration::TAIL_TIME_B);
+    const uint16_t timeDimColor = colorWithBrightness(_matrix,
+                                                      DisplayConfiguration::TAIL_TIME_DIM_R,
+                                                      DisplayConfiguration::TAIL_TIME_DIM_G,
+                                                      DisplayConfiguration::TAIL_TIME_DIM_B);
+    const uint16_t locColor     = colorWithBrightness(_matrix,
+                                                      DisplayConfiguration::TAIL_LOC_R,
+                                                      DisplayConfiguration::TAIL_LOC_G,
+                                                      DisplayConfiguration::TAIL_LOC_B);
+
+    drawTextLine(startX,  1, statusLine, textColor);
+
+    // Draw the time line character by character so the unit letters "h" and "m"
+    // are rendered dimmer than the numeric digits.
+    _matrix->setCursor(startX, 10);
+    for (size_t i = 0; i < (size_t)timeLine.length(); ++i)
+    {
+        const char c = timeLine[i];
+        _matrix->setTextColor((c >= '0' && c <= '9') ? timeColor : timeDimColor);
+        _matrix->write(c);
+    }
+
+    drawTextLine(startX, 19, locLine,    locColor);
+
+    // --- Progress bar (bottom 2 rows) ---
+    // Background: very dim grey stripe across the full width.
+    const uint16_t barBg = _matrix->color565(DisplayConfiguration::TAIL_BAR_BG_R,
+                                              DisplayConfiguration::TAIL_BAR_BG_G,
+                                              DisplayConfiguration::TAIL_BAR_BG_B);
+    const uint16_t barFg = colorWithBrightness(_matrix,
+                                               DisplayConfiguration::TAIL_BAR_FG_R,
+                                               DisplayConfiguration::TAIL_BAR_FG_G,
+                                               DisplayConfiguration::TAIL_BAR_FG_B);
+    _matrix->fillRect(0, 30, (int16_t)_matrixWidth, 2, barBg);
+
+    int fillW = ((int)status.progress_percent * (int)_matrixWidth) / 100;
+    if (fillW > (int)_matrixWidth) fillW = (int)_matrixWidth;
+    if (fillW > 0)
+        _matrix->fillRect(0, 30, (int16_t)fillW, 2, barFg);
+
+    _matrix->show();
+}
+
+void ProtomatterDisplay::displayTailLoading()
+{
+    if (_matrix == nullptr) return;
+
+    _matrix->fillScreen(0);
+
+    const uint16_t color = colorWithBrightness(_matrix,
+                                               DisplayConfiguration::TAIL_LOADING_R,
+                                               DisplayConfiguration::TAIL_LOADING_G,
+                                               DisplayConfiguration::TAIL_LOADING_B);
+    const String   text  = "Tracking";
+    const int      charWidth  = 6;
+    const int      charHeight = 8;
+    const int16_t  x = ((int16_t)_matrixWidth  - (int16_t)(text.length() * charWidth))  / 2;
+    const int16_t  y = ((int16_t)_matrixHeight - charHeight) / 2 - 2;
+
+    drawTextLine(x, y, text, color);
+    _matrix->show();
 }
 
 #endif // FLIGHTWALL_DISPLAY_PROTOMATTER
