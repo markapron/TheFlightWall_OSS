@@ -5,8 +5,10 @@
 namespace UserConfiguration
 {
     // Location configuration
-    static const double CENTER_LAT = 39.8370; // San Francisco (example)
-    static const double CENTER_LON = -75.4490;
+    static const double CENTER_LAT = 40.6892; // San Francisco (example)
+    static const double CENTER_LON = -73.9557;
+    // static const double CENTER_LAT = 39.8370; // San Francisco (example)
+    // static const double CENTER_LON = -75.4490;
     static const double RADIUS_KM = 30.0; // Search radius in km
 
     // Maximum number of flights to enrich with AeroAPI per fetch cycle.

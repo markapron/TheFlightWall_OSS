@@ -22,6 +22,7 @@ Configuration: UserConfiguration, TailTrackerConfiguration, TimingConfiguration,
 #include "config/TimingConfiguration.h"
 #include "config/HardwareConfiguration.h"
 #include "config/TailTrackerConfiguration.h"
+#include "SerialConfig.h"
 #include "adapters/OpenSkyFetcher.h"
 #include "adapters/AeroAPIFetcher.h"
 #include "adapters/TailTrackerFetcher.h"
@@ -43,12 +44,19 @@ using ActiveDisplay = ProtomatterDisplay;
 
 enum AppMode
 {
-    MODE_NEARBY      = 0, // existing nearby-flights display
-    MODE_TAIL_TRACKER = 1, // new single-aircraft tracker
-    MODE_COUNT        = 2,
+    MODE_NEARBY       = 0, // nearby-flights display
+    MODE_TAIL_TRACKER = 1, // single-aircraft tracker
+    MODE_SLEEP        = 2, // display off, no fetching (DOWN once)
+    MODE_SERIAL_CONFIG = 3, // serial config menu active, no fetching (DOWN x3)
+    MODE_COUNT        = 4,
 };
 
-static AppMode g_appMode = MODE_NEARBY;
+// Number of "normal" (cycling) modes — SLEEP and SERIAL_CONFIG are not
+// reachable via the UP-button cycle.
+static const int kCycleModeCount = 2;
+
+static AppMode g_appMode      = MODE_NEARBY;
+static AppMode g_prevActiveMode = MODE_NEARBY; // mode to restore after sleep/config
 
 // ---------------------------------------------------------------------------
 // Global objects
@@ -82,6 +90,11 @@ static void displayTick()
     // Process button presses mid-fetch so a mode switch is never blocked by
     // a long-running HTTPS request.
     checkButtons();
+
+    // Don't touch the display in sleep or config modes.
+    if (g_appMode == MODE_SLEEP || g_appMode == MODE_SERIAL_CONFIG)
+        return;
+
     if (g_appMode == MODE_TAIL_TRACKER)
     {
         if (g_tailStatus.valid)
@@ -99,55 +112,123 @@ static void displayTick()
 // Button handling
 // ---------------------------------------------------------------------------
 
-// Set by the hardware interrupt; read and cleared in checkButtons().
-// volatile so the compiler never caches it across interrupt boundaries.
-static volatile bool g_buttonUpPressed = false;
+// ISR flags — set by hardware interrupts, read and cleared in checkButtons().
+static volatile bool g_buttonUpPressed   = false;
+static volatile bool g_buttonDownPressed = false;
 
-static void buttonUpISR()
-{
-    g_buttonUpPressed = true;
-}
+static void buttonUpISR()   { g_buttonUpPressed   = true; }
+static void buttonDownISR() { g_buttonDownPressed = true; }
 
-static unsigned long g_lastButtonMs = 0;
-static const unsigned long kButtonDebounceMs = 300;
+// Per-button debounce timestamps.
+static unsigned long g_lastUpMs   = 0;
+static unsigned long g_lastDownMs = 0;
+static const unsigned long kButtonDebounceMs = 150;
+
+// Multi-tap state for the DOWN button.
+// Presses are accumulated for up to kDownTapWindowMs after the first press.
+// 3+ presses → serial config (triggered immediately on the 3rd press).
+// 1 press + timeout → sleep.
+static int           g_downTapCount      = 0;
+static unsigned long g_downFirstTapMs    = 0;
+static const unsigned long kDownTapWindowMs = 700;
 
 static void checkButtons()
 {
     const unsigned long now = millis();
-    if (now - g_lastButtonMs < kButtonDebounceMs) return;
 
-    // Consume the interrupt-latched flag rather than polling digitalRead().
-    // The ISR fires on the falling edge (press), so the flag is true even if
-    // the button was released before checkButtons() ran.
-    bool up = g_buttonUpPressed;
-    if (up) g_buttonUpPressed = false;
-
-    if (!up) return;
-
-    g_lastButtonMs = now;
-
-    AppMode prev = g_appMode;
-    g_appMode = static_cast<AppMode>(((int)g_appMode + 1) % MODE_COUNT);
-
-    if (g_appMode != prev)
+    // ---- UP button: cycle between normal display modes ---------------------
+    if (g_buttonUpPressed && now - g_lastUpMs >= kButtonDebounceMs)
     {
-        Serial.print("Mode → ");
-        Serial.println(g_appMode == MODE_TAIL_TRACKER ? "TAIL_TRACKER" : "NEARBY");
+        g_buttonUpPressed = false;
+        g_lastUpMs = now;
 
-        // For tail tracker: only force an immediate fetch when there is no
-        // cached data yet. If valid data exists, show it right away and let
-        // the normal 60-second interval govern when to refresh.
-        // For nearby mode: always re-fetch immediately on switch so the list
-        // reflects current traffic rather than showing stale data.
-        if (g_appMode == MODE_TAIL_TRACKER)
+        if (g_appMode == MODE_SLEEP || g_appMode == MODE_SERIAL_CONFIG)
         {
-            if (!g_tailStatus.valid)
-                g_lastTailFetchMs = 0;
+            // UP always exits sleep / config and returns to the previous mode.
+            g_appMode = g_prevActiveMode;
+            g_lastFetchMs     = 0;
+            g_lastTailFetchMs = 0;
+            Serial.print(F("UP: restored mode → "));
+            Serial.println(g_appMode == MODE_TAIL_TRACKER ? "TAIL_TRACKER" : "NEARBY");
         }
         else
         {
-            g_lastFetchMs = 0;
+            AppMode prev = g_appMode;
+            g_appMode = static_cast<AppMode>(((int)g_appMode + 1) % kCycleModeCount);
+            if (g_appMode != prev)
+            {
+                g_prevActiveMode = g_appMode;
+                Serial.print(F("Mode → "));
+                Serial.println(g_appMode == MODE_TAIL_TRACKER ? "TAIL_TRACKER" : "NEARBY");
+                if (g_appMode == MODE_TAIL_TRACKER)
+                {
+                    if (!g_tailStatus.valid) g_lastTailFetchMs = 0;
+                }
+                else
+                {
+                    g_lastFetchMs = 0;
+                }
+            }
         }
+    }
+
+    // ---- DOWN button: multi-tap detection ----------------------------------
+    // While sleeping any press wakes immediately. Otherwise presses are
+    // accumulated: 3 within kDownTapWindowMs → serial config (fires on 3rd
+    // press); 1 press + timeout → sleep. Double-press is a no-op.
+
+    if (g_buttonDownPressed && now - g_lastDownMs >= kButtonDebounceMs)
+    {
+        g_buttonDownPressed = false;
+        g_lastDownMs = now;
+
+        if (g_appMode == MODE_SLEEP)
+        {
+            // Any press exits sleep immediately; reset tap counter.
+            g_downTapCount   = 0;
+            g_downFirstTapMs = 0;
+            g_appMode        = g_prevActiveMode;
+            g_lastFetchMs     = 0;
+            g_lastTailFetchMs = 0;
+            Serial.println(F("DOWN: waking up."));
+        }
+        else if (g_appMode != MODE_SERIAL_CONFIG)
+        {
+            if (g_downTapCount == 0)
+                g_downFirstTapMs = now;
+            g_downTapCount++;
+            Serial.print(F("DOWN tap "));
+            Serial.println(g_downTapCount);
+
+            if (g_downTapCount >= 3)
+            {
+                // Triple press: enter serial config immediately.
+                g_downTapCount   = 0;
+                g_downFirstTapMs = 0;
+                g_prevActiveMode = g_appMode;
+                g_appMode = MODE_SERIAL_CONFIG;
+                g_display.displayMessage(String("FlightWall Config"));
+                Serial.println(F("--- Serial config mode (DOWN x3) ---"));
+                SerialConfig::openMenu();
+            }
+            // else: keep counting; single/double-press action deferred to timeout below.
+        }
+    }
+
+    // Tap-window timeout: commit deferred single-press action.
+    if (g_downTapCount > 0 && g_downFirstTapMs != 0 &&
+        now - g_downFirstTapMs >= kDownTapWindowMs)
+    {
+        if (g_downTapCount == 1 &&
+            g_appMode != MODE_SLEEP && g_appMode != MODE_SERIAL_CONFIG)
+        {
+            g_prevActiveMode = g_appMode;
+            g_appMode = MODE_SLEEP;
+            g_display.clear();
+            Serial.println(F("DOWN: sleep mode."));
+        }
+        g_downTapCount   = 0;
+        g_downFirstTapMs = 0;
     }
 }
 
@@ -220,21 +301,24 @@ void setup()
 {
     Serial.begin(115200);
     delay(200);
+    SerialConfig::begin();
 
     // Configure Matrix Portal M4 UP/DOWN buttons (active LOW, internal pull-up).
     pinMode(HardwareConfiguration::BUTTON_UP_PIN,   INPUT_PULLUP);
     pinMode(HardwareConfiguration::BUTTON_DOWN_PIN, INPUT_PULLUP);
 
-    // Attach a hardware interrupt to the UP button so presses are latched
-    // even during blocking HTTPS fetches.  FALLING = HIGH→LOW on press.
+    // Attach hardware interrupts to both buttons so presses are latched even
+    // during blocking HTTPS fetches.  FALLING = HIGH→LOW (active-LOW buttons).
     attachInterrupt(digitalPinToInterrupt(HardwareConfiguration::BUTTON_UP_PIN),
                     buttonUpISR, FALLING);
+    attachInterrupt(digitalPinToInterrupt(HardwareConfiguration::BUTTON_DOWN_PIN),
+                    buttonDownISR, FALLING);
 
     g_display.initialize();
     g_display.displayMessage(String("FlightWall"));
     wifiClientTick = displayTick;
 
-    if (strlen(WiFiConfiguration::WIFI_SSID) > 0)
+    if (SerialConfig::wifiSSID.length() > 0)
     {
 #if !defined(ARDUINO_ARCH_ESP32)
         Serial.print("WiFiNINA firmware: ");
@@ -245,8 +329,8 @@ void setup()
 
         printWifiScan();
 
-        g_display.displayMessage(String("WiFi: ") + WiFiConfiguration::WIFI_SSID);
-        WiFi.begin(WiFiConfiguration::WIFI_SSID, WiFiConfiguration::WIFI_PASSWORD);
+        g_display.displayMessage(String("WiFi: ") + SerialConfig::wifiSSID);
+        WiFi.begin(SerialConfig::wifiSSID.c_str(), SerialConfig::wifiPassword.c_str());
         Serial.print("Connecting to WiFi");
         int attempts = 0;
         int lastStatus = -999;
@@ -297,13 +381,36 @@ void loop()
 {
     const unsigned long now = millis();
 
+    SerialConfig::tick();
     checkButtons();
+
+    // --- MODE_SLEEP / MODE_SERIAL_CONFIG: do nothing (no fetch, no display) ---
+    if (g_appMode == MODE_SLEEP)
+    {
+        delay(10);
+        return;
+    }
+
+    if (g_appMode == MODE_SERIAL_CONFIG)
+    {
+        // Auto-exit serial config once the user closes the menu with 'x'.
+        if (!SerialConfig::isMenuOpen())
+        {
+            g_appMode = g_prevActiveMode;
+            g_lastFetchMs     = 0;
+            g_lastTailFetchMs = 0;
+            Serial.println(F("Serial config closed — resuming normal operation."));
+        }
+        delay(10);
+        return;
+    }
 
     // --- MODE_NEARBY: fetch nearby flights and cycle through them ---
     if (g_appMode == MODE_NEARBY)
     {
         const unsigned long intervalMs = TimingConfiguration::FETCH_INTERVAL_SECONDS * 1000UL;
-        if (g_lastFetchMs == 0 || now - g_lastFetchMs >= intervalMs)
+        if ((g_lastFetchMs == 0 || now - g_lastFetchMs >= intervalMs) &&
+            WiFi.status() == WL_CONNECTED)
         {
             std::vector<StateVector> states;
             std::vector<FlightInfo>  flights;
@@ -345,7 +452,10 @@ void loop()
             g_lastFetchMs   = millis();
         }
 
-        g_display.displayFlights(g_cachedFlights);
+        // Re-check mode: it may have changed to SLEEP/CONFIG during the
+        // blocking fetch above (via displayTick → checkButtons).
+        if (g_appMode == MODE_NEARBY)
+            g_display.displayFlights(g_cachedFlights);
     }
 
     // --- MODE_TAIL_TRACKER: fetch status for the configured tail number ---
@@ -354,14 +464,15 @@ void loop()
         const unsigned long tailIntervalMs =
             TailTrackerConfiguration::FETCH_INTERVAL_SECONDS * 1000UL;
 
-        if (g_lastTailFetchMs == 0 || now - g_lastTailFetchMs >= tailIntervalMs)
+        if ((g_lastTailFetchMs == 0 || now - g_lastTailFetchMs >= tailIntervalMs) &&
+            WiFi.status() == WL_CONNECTED)
         {
             Serial.print("TailTracker: fetching status for ");
-            Serial.println(TailTrackerConfiguration::TRACKED_TAIL_NUMBER);
+            Serial.println(SerialConfig::tailNumber);
 
             TailFlightStatus newStatus;
             if (g_tailFetcher.fetchStatus(
-                    TailTrackerConfiguration::TRACKED_TAIL_NUMBER, newStatus))
+                    SerialConfig::tailNumber.c_str(), newStatus))
             {
                 g_tailStatus = newStatus;
                 Serial.print("TailTracker: status=");
@@ -381,10 +492,14 @@ void loop()
             g_lastTailFetchMs = millis();
         }
 
-        if (g_tailStatus.valid)
-            g_display.displayTailTracker(g_tailStatus);
-        else
-            g_display.displayTailLoading();
+        // Re-check mode for the same reason as above.
+        if (g_appMode == MODE_TAIL_TRACKER)
+        {
+            if (g_tailStatus.valid)
+                g_display.displayTailTracker(g_tailStatus);
+            else
+                g_display.displayTailLoading();
+        }
     }
 
     delay(10);
