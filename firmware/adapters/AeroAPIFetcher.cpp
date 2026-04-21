@@ -8,6 +8,8 @@ Input: flight ident (e.g., callsign).
 Output: Populates FlightInfo on success and returns true.
 */
 #include "adapters/AeroAPIFetcher.h"
+#include <ArduinoHttpClient.h>
+#include "utils/HttpUtils.h"
 
 static String safeGetString(JsonVariant v, const char *key)
 {
@@ -24,31 +26,68 @@ bool AeroAPIFetcher::fetchFlightInfo(const String &flightIdent, FlightInfo &outI
         return false;
     }
 
-    WiFiClientSecure client;
-    if (APIConfiguration::AEROAPI_INSECURE_TLS)
+    const String url = String(APIConfiguration::AEROAPI_BASE_URL) + "/flights/" + flightIdent;
+    bool https = true;
+    String host;
+    uint16_t port = 443;
+    String path;
+    if (!parseUrl(url, https, host, port, path))
     {
-        client.setInsecure();
+        Serial.println("AeroAPIFetcher: Failed to parse URL");
+        return false;
     }
+#if defined(FLIGHTWALL_SKIP_TLS)
+    https = false;
+    port = 80;
+    Serial.println("AeroAPIFetcher: SKIP_TLS active — forcing plain HTTP on port 80");
+#else
+    if (!https)
+    {
+        Serial.println("AeroAPIFetcher: Refusing non-HTTPS URL");
+        return false;
+    }
+#endif
 
-    HTTPClient http;
-    String url = String(APIConfiguration::AEROAPI_BASE_URL) + "/flights/" + flightIdent;
-    http.begin(client, url);
-    http.addHeader("x-apikey", APIConfiguration::AEROAPI_KEY);
-    http.addHeader("Accept", "application/json");
+    int code = -1;
+    String payload;
 
-    int code = http.GET();
+#if defined(ARDUINO_ARCH_ESP32)
+    {
+        FlightWallTlsClient net;
+        #if !defined(FLIGHTWALL_SKIP_TLS)
+        if (APIConfiguration::AEROAPI_INSECURE_TLS)
+            net.setInsecure();
+        #endif
+        HttpClient http(net, host.c_str(), port);
+        http.setHttpResponseTimeout(30000);
+        http.beginRequest();
+        http.get(path);
+        http.sendHeader("x-apikey", APIConfiguration::AEROAPI_KEY);
+        http.sendHeader("Accept", "application/json");
+        http.endRequest();
+        code = http.responseStatusCode();
+        payload = http.responseBody();
+    }
+#else
+    {
+        const String extraHeaders = String("x-apikey: ") + APIConfiguration::AEROAPI_KEY + "\r\nAccept: application/json\r\n";
+        if (!wifiClientRequest("GET", host, port, path, extraHeaders, "", code, payload))
+        {
+            Serial.printf("AeroAPIFetcher: wifiClientRequest failed for flight %s\n", flightIdent.c_str());
+            return false;
+        }
+    }
+#endif
+
     if (code != 200)
     {
         Serial.printf("AeroAPIFetcher: HTTP request failed with code %d for flight %s\n", code, flightIdent.c_str());
-        http.end();
         return false;
     }
 
-    String payload = http.getString();
-    http.end();
-
     DynamicJsonDocument doc(16384);
     DeserializationError err = deserializeJson(doc, payload);
+    payload = String(); // free ~25 KB before extracting fields from doc
     if (err)
     {
         Serial.printf("AeroAPIFetcher: JSON parsing failed for flight %s: %s\n", flightIdent.c_str(), err.c_str());

@@ -9,6 +9,23 @@ Inputs: centerLat, centerLon, radiusKm, min/max bearing; APIConfiguration creds/
 Outputs: Populates outStateVectors with filtered results (distance_km, bearing_deg set).
 */
 #include "adapters/OpenSkyFetcher.h"
+#include <ArduinoHttpClient.h>
+#include "utils/HttpUtils.h"
+
+// On ESP32, ArduinoHttpClient + WiFiClientSecure works correctly.
+// On SAMD/AirLift, we use WiFiSSLClient directly via wifiClientRequest() in HttpUtils,
+// because ArduinoHttpClient sends headers as many small print() fragments that the AirLift's
+// SPI transport never flushes as a complete HTTP request, causing persistent -3 timeouts.
+#if defined(ARDUINO_ARCH_ESP32)
+  #if defined(FLIGHTWALL_SKIP_TLS)
+    #include <WiFi.h>
+    using FlightWallTlsClient = WiFiClient;
+  #else
+    #include <WiFi.h>
+    #include <WiFiClientSecure.h>
+    using FlightWallTlsClient = WiFiClientSecure;
+  #endif
+#endif
 
 static String urlEncodeForm(const String &value)
 {
@@ -82,45 +99,80 @@ bool OpenSkyFetcher::requestAccessToken(String &outToken, unsigned long &outExpi
         return false;
     }
 
-    HTTPClient http;
+    const String url = String(APIConfiguration::OPENSKY_TOKEN_URL);
     Serial.print("OpenSkyFetcher: Token URL: ");
-    Serial.println(APIConfiguration::OPENSKY_TOKEN_URL);
-    http.begin(APIConfiguration::OPENSKY_TOKEN_URL);
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    http.addHeader("Accept", "application/json");
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    Serial.println(url);
 
-    String body = String("grant_type=client_credentials&client_id=") + urlEncodeForm(APIConfiguration::OPENSKY_CLIENT_ID) +
-                  "&client_secret=" + urlEncodeForm(APIConfiguration::OPENSKY_CLIENT_SECRET);
+    bool https = true;
+    String host;
+    uint16_t port = 443;
+    String path;
+    if (!parseUrl(url, https, host, port, path))
+    {
+        Serial.println("OpenSkyFetcher: Failed to parse token URL");
+        return false;
+    }
+#if defined(FLIGHTWALL_SKIP_TLS)
+    https = false;
+    port = 80;
+    Serial.println("OpenSkyFetcher: SKIP_TLS active — forcing plain HTTP on port 80 for token request");
+#else
+    if (!https)
+    {
+        Serial.println("OpenSkyFetcher: Refusing non-HTTPS token URL");
+        return false;
+    }
+#endif
 
-    // Debug: show request (without exposing secret)
+    const String body = String("grant_type=client_credentials&client_id=") + urlEncodeForm(APIConfiguration::OPENSKY_CLIENT_ID) +
+                        "&client_secret=" + urlEncodeForm(APIConfiguration::OPENSKY_CLIENT_SECRET);
+
     Serial.print("OpenSkyFetcher: Using client_id: ");
     Serial.println(APIConfiguration::OPENSKY_CLIENT_ID);
-    Serial.print("OpenSkyFetcher: client_secret length: ");
-    Serial.println((int)strlen(APIConfiguration::OPENSKY_CLIENT_SECRET));
     Serial.print("OpenSkyFetcher: POST body length: ");
     Serial.println((int)body.length());
-    http.setTimeout(15000);
 
-    int code = http.POST(body);
-    String payload = http.getString();
+    int code = -1;
+    String payload;
+
+#if defined(ARDUINO_ARCH_ESP32)
+    {
+        FlightWallTlsClient net;
+        #if defined(ARDUINO_ARCH_ESP32) && !defined(FLIGHTWALL_SKIP_TLS)
+        // ESP32: no cert validation needed for development
+        #endif
+        HttpClient http(net, host.c_str(), port);
+        http.setHttpResponseTimeout(30000);
+        http.beginRequest();
+        http.post(path);
+        http.sendHeader("Content-Type", "application/x-www-form-urlencoded");
+        http.sendHeader("Accept", "application/json");
+        http.sendHeader("Content-Length", body.length());
+        http.beginBody();
+        http.print(body);
+        http.endRequest();
+        code = http.responseStatusCode();
+        payload = http.responseBody();
+    }
+#else
+    {
+        const String extraHeaders = "Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\n";
+        if (!wifiClientRequest("POST", host, port, path, extraHeaders, body, code, payload))
+        {
+            Serial.println("OpenSkyFetcher: Token request (wifiClientRequest) failed");
+            return false;
+        }
+    }
+#endif
+
     if (code != 200)
     {
         Serial.print("OpenSkyFetcher: Token request failed, code: ");
         Serial.println(code);
         Serial.print("OpenSkyFetcher: Error payload: ");
-        if (payload.length() > 0)
-        {
-            Serial.println(payload);
-        }
-        else
-        {
-            Serial.println("<empty>");
-        }
-        http.end();
+        Serial.println(payload.length() > 0 ? payload : String("<empty>"));
         return false;
     }
-    http.end();
 
     DynamicJsonDocument doc(12288);
     DeserializationError err = deserializeJson(doc, payload);
@@ -176,126 +228,92 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
     double latMin, latMax, lonMin, lonMax;
     centeredBoundingBox(centerLat, centerLon, radiusKm, latMin, latMax, lonMin, lonMax);
 
-    String url = String(APIConfiguration::OPENSKY_BASE_URL) + "/api/states/all?lamin=" + String(latMin, 6) +
+    const String url = String(APIConfiguration::OPENSKY_BASE_URL) + "/api/states/all?lamin=" + String(latMin, 6) +
                  "&lamax=" + String(latMax, 6) +
                  "&lomin=" + String(lonMin, 6) +
                  "&lomax=" + String(lonMax, 6);
 
-    HTTPClient http;
-    http.begin(url);
-    // OAuth Bearer required
-    http.addHeader("Authorization", String("Bearer ") + m_accessToken);
-
-    int code = http.GET();
-    if (code != 200)
+    bool https = true;
+    String host;
+    uint16_t port = 443;
+    String path;
+    if (!parseUrl(url, https, host, port, path))
     {
-        bool attemptedRefresh = false;
-        if (code == 401 && m_accessToken.length() > 0)
-        {
-            // Try refresh once
-            http.end();
-            if (ensureAccessToken(true))
-            {
-                HTTPClient retry;
-                retry.begin(url);
-                retry.addHeader("Authorization", String("Bearer ") + m_accessToken);
-                code = retry.GET();
-                if (code != 200)
-                {
-                    Serial.print("OpenSkyFetcher: HTTP retry failed with code: ");
-                    Serial.println(code);
-                    retry.end();
-                    return false;
-                }
-                String payload = retry.getString();
-                retry.end();
-
-                DynamicJsonDocument doc(16384);
-                DeserializationError err = deserializeJson(doc, payload);
-                if (err)
-                {
-                    Serial.print("OpenSkyFetcher: JSON deserialization error: ");
-                    Serial.println(err.c_str());
-                    return false;
-                }
-
-                JsonArray states = doc["states"].as<JsonArray>();
-                if (states.isNull())
-                {
-                    return true; // no states is not an error
-                }
-
-                for (JsonVariant v : states)
-                {
-                    if (!v.is<JsonArray>())
-                    {
-                        Serial.println("OpenSkyFetcher: Expected array element in states");
-                        continue;
-                    }
-                    JsonArray a = v.as<JsonArray>();
-                    if (a.size() < 17)
-                    {
-                        Serial.println("OpenSkyFetcher: State vector array has insufficient elements");
-                        continue;
-                    }
-
-                    StateVector s;
-                    s.icao24 = a[0].as<const char *>();
-                    s.callsign = a[1].isNull() ? String("") : String(a[1].as<const char *>());
-                    s.callsign.trim();
-                    s.origin_country = a[2].isNull() ? String("") : String(a[2].as<const char *>());
-                    s.time_position = a[3].isNull() ? 0 : a[3].as<long>();
-                    s.last_contact = a[4].isNull() ? 0 : a[4].as<long>();
-                    s.lon = a[5].isNull() ? NAN : a[5].as<double>();
-                    s.lat = a[6].isNull() ? NAN : a[6].as<double>();
-                    s.baro_altitude = a[7].isNull() ? NAN : a[7].as<double>();
-                    s.on_ground = a[8].isNull() ? false : a[8].as<bool>();
-                    s.velocity = a[9].isNull() ? NAN : a[9].as<double>();
-                    s.heading = a[10].isNull() ? NAN : a[10].as<double>();
-                    s.vertical_rate = a[11].isNull() ? NAN : a[11].as<double>();
-                    s.sensors = a[12].isNull() ? 0 : a[12].as<long>();
-                    s.geo_altitude = a[13].isNull() ? NAN : a[13].as<double>();
-                    s.squawk = a[14].isNull() ? String("") : String(a[14].as<const char *>());
-                    s.spi = a[15].isNull() ? false : a[15].as<bool>();
-                    s.position_source = a[16].isNull() ? 0 : a[16].as<int>();
-
-                    if (isnan(s.lat) || isnan(s.lon))
-                    {
-                        Serial.println("OpenSkyFetcher: Skipping state vector with invalid coordinates");
-                        continue;
-                    }
-
-                    s.distance_km = haversineKm(centerLat, centerLon, s.lat, s.lon);
-                    if (s.distance_km > radiusKm)
-                        continue;
-                    s.bearing_deg = computeBearingDeg(centerLat, centerLon, s.lat, s.lon);
-
-                    outStateVectors.push_back(s);
-                }
-
-                return true;
-            }
-            attemptedRefresh = true;
-        }
-
-        Serial.print("OpenSkyFetcher: HTTP request failed with code: ");
-        Serial.println(code);
-        http.end();
-        if (attemptedRefresh)
-        {
-            Serial.println("OpenSkyFetcher: Token refresh attempt failed");
-        }
+        Serial.println("OpenSkyFetcher: Failed to parse states URL");
         return false;
     }
-    String payload = http.getString();
-    http.end();
+#if defined(FLIGHTWALL_SKIP_TLS)
+    https = false;
+    port = 80;
+    Serial.println("OpenSkyFetcher: SKIP_TLS active — forcing plain HTTP on port 80 for states request");
+#else
+    if (!https)
+    {
+        Serial.println("OpenSkyFetcher: Refusing non-HTTPS states URL");
+        return false;
+    }
+#endif
 
-    DynamicJsonDocument doc(16384);
+    int code = -1;
+    String payload;
+
+    // Helper that performs the states GET with the current access token.
+    // Called once normally, then again after a 401 token refresh.
+    auto doStatesGet = [&]() -> bool {
+#if defined(ARDUINO_ARCH_ESP32)
+        FlightWallTlsClient net;
+        HttpClient http(net, host.c_str(), port);
+        http.setHttpResponseTimeout(30000);
+        http.beginRequest();
+        http.get(path);
+        http.sendHeader("Authorization", String("Bearer ") + m_accessToken);
+        http.endRequest();
+        code = http.responseStatusCode();
+        payload = http.responseBody();
+        return true;
+#else
+        const String extraHeaders = String("Authorization: Bearer ") + m_accessToken + "\r\nAccept: application/json\r\n";
+        return wifiClientRequest("GET", host, port, path, extraHeaders, "", code, payload);
+#endif
+    };
+
+    if (!doStatesGet())
+    {
+        Serial.println("OpenSkyFetcher: States GET failed");
+        return false;
+    }
+
+    // 401: token may have expired — refresh and retry once
+    if (code == 401 && m_accessToken.length() > 0 && ensureAccessToken(true))
+    {
+        payload = "";
+        if (!doStatesGet())
+        {
+            Serial.println("OpenSkyFetcher: States GET retry failed after token refresh");
+            return false;
+        }
+    }
+
+    if (code != 200)
+    {
+        Serial.print("OpenSkyFetcher: HTTP request failed with code: ");
+        Serial.println(code);
+        return false;
+    }
+
+    // The OpenSky states response is ~20-25 KB of JSON. ArduinoJson needs roughly
+    // 1.5x the raw JSON size for its internal representation. 48 KB is safe on the
+    // SAMD51's 192 KB of RAM, provided we free the raw payload string first.
+    DynamicJsonDocument doc(49152);
     DeserializationError err = deserializeJson(doc, payload);
+    payload = String(); // free ~21 KB before iterating the doc tree
     if (err)
     {
         Serial.print("OpenSkyFetcher: JSON deserialization error: ");
-        Serial.println(err.c_str());
+        Serial.print(err.c_str());
+        Serial.print(" (payload length: ");
+        Serial.print(payload.length());
+        Serial.println(")");
         return false;
     }
 
