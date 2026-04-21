@@ -6,7 +6,7 @@ namespace HardwareConfiguration
 {
     // --- HUB75 RGB matrix (Adafruit Matrix Portal M4 / Protomatter) ---
     // Defaults from Adafruit's MatrixPortal M4 Protomatter guide.
-    static const uint16_t HUB75_MATRIX_WIDTH = 64;
+    static const uint16_t HUB75_MATRIX_WIDTH = 128;
     static const uint16_t HUB75_MATRIX_HEIGHT = 32;
     static const uint8_t HUB75_BIT_DEPTH = 4;       // 1-6
     static const bool HUB75_DOUBLE_BUFFER = true;   // smoother updates, more RAM
