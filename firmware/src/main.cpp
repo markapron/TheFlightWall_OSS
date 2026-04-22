@@ -479,7 +479,9 @@ void loop()
                 Serial.print(g_tailStatus.status);
                 Serial.print(" progress=");
                 Serial.print(g_tailStatus.progress_percent);
-                Serial.print("% city=");
+                Serial.print("% alt=");
+                Serial.print(g_tailStatus.altitude_ft);
+                Serial.print("ft city=");
                 Serial.print(g_tailStatus.city);
                 Serial.print(" ");
                 Serial.println(g_tailStatus.region);

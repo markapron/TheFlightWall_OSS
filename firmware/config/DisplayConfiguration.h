@@ -80,4 +80,21 @@ namespace DisplayConfiguration
     static const uint8_t TAIL_LOADING_R = 255;
     static const uint8_t TAIL_LOADING_G = 200;
     static const uint8_t TAIL_LOADING_B =  50;
+
+    // -------------------------------------------------------------------------
+    // Tail tracker — compass widget (right-side bearing indicator)
+    // RING is the outer circle; NORTH is the 12 o'clock tick; NEEDLE points
+    // toward the tracked aircraft.
+    // -------------------------------------------------------------------------
+    static const uint8_t TAIL_COMPASS_RING_R   =  60;
+    static const uint8_t TAIL_COMPASS_RING_G   =  80;
+    static const uint8_t TAIL_COMPASS_RING_B   = 180;
+
+    static const uint8_t TAIL_COMPASS_NORTH_R  = 100;
+    static const uint8_t TAIL_COMPASS_NORTH_G  = 100;
+    static const uint8_t TAIL_COMPASS_NORTH_B  = 100;
+
+    static const uint8_t TAIL_COMPASS_NEEDLE_R = 255;
+    static const uint8_t TAIL_COMPASS_NEEDLE_G = 100;
+    static const uint8_t TAIL_COMPASS_NEEDLE_B =   0;
 }

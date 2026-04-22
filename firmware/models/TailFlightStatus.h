@@ -24,6 +24,9 @@ struct TailFlightStatus
     double lat = NAN;
     double lon = NAN;
 
+    // Altitude in feet from last_position; 0 when unavailable.
+    int altitude_ft = 0;
+
     // Reverse-geocoded location strings.
     String city;
     String region; // 2-letter US state or 2-letter ISO country code

@@ -24,9 +24,10 @@ private:
 
     // Falls back to GetLastTrack when last_position is absent from the
     // flights response.  Iterates the track array and returns the most
-    // recent lat/lon.  Returns false if the track is unavailable or empty.
+    // recent lat/lon/altitude.  Returns false if the track is unavailable
+    // or empty.  outAlt is set to 0 when the endpoint omits altitude.
     bool fetchTrackPosition(const String &faFlightId,
-                            double &outLat, double &outLon);
+                            double &outLat, double &outLon, int &outAlt);
 
     bool fetchReverseGeocode(double lat, double lon,
                              String &outCity, String &outRegion);

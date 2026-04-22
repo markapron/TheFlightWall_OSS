@@ -98,10 +98,13 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
         outCode = statusLine.substring(sp + 1, sp + 4).toInt();
     }
 
-    // Read response headers, detect Transfer-Encoding: chunked
+    // Read response headers, detect Transfer-Encoding: chunked.
+    // tick() is called on every iteration so button presses and display updates
+    // are not frozen while a slow server delivers headers one at a time.
     bool isChunked = false;
     while (client.connected() || client.available())
     {
+        tick();
         String line = client.readStringUntil('\n');
         line.trim();
         if (line.length() == 0)

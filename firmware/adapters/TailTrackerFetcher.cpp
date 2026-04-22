@@ -161,6 +161,11 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     filter["flights"][0]["actual_on"]        = true;
     filter["flights"][0]["last_position"]["latitude"]  = true;
     filter["flights"][0]["last_position"]["longitude"] = true;
+    filter["flights"][0]["last_position"]["altitude"]  = true;
+    filter["flights"][0]["origin"]["city"]              = true;
+    filter["flights"][0]["origin"]["name"]              = true;
+    filter["flights"][0]["origin"]["state"]             = true;
+    filter["flights"][0]["origin"]["country_code"]      = true;
     filter["flights"][0]["destination"]["city"]         = true;
     filter["flights"][0]["destination"]["name"]         = true;
     filter["flights"][0]["destination"]["code_iata"]    = true;
@@ -213,8 +218,9 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     result.status = safeStr(f, "status");
 
     // Normalise status variants returned by different AeroAPI versions.
-    if (result.status == "Arrived")                          result.status = "Landed";
-    if (result.status.startsWith("En Route"))                result.status = "Flying";
+    if (result.status == "Arrived")               result.status = "Landed";
+    if (result.status.startsWith("En Route"))     result.status = "Flying";
+    if (result.status.startsWith("Arriving"))     result.status = "Arriving";
 
     result.progress_percent = 0;
     if (!f["progress_percent"].isNull())
@@ -244,12 +250,20 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
 
     result.lat = NAN;
     result.lon = NAN;
+    result.altitude_ft = 0;
     if (!f["last_position"].isNull())
     {
         JsonObject pos = f["last_position"].as<JsonObject>();
-        if (!pos["latitude"].isNull())  result.lat = pos["latitude"].as<double>();
-        if (!pos["longitude"].isNull()) result.lon = pos["longitude"].as<double>();
+        if (!pos["latitude"].isNull())  result.lat          = pos["latitude"].as<double>();
+        if (!pos["longitude"].isNull()) result.lon          = pos["longitude"].as<double>();
+        if (!pos["altitude"].isNull())  result.altitude_ft  = pos["altitude"].as<int>();
     }
+    Serial.print("TailTrackerFetcher: lat=");
+    Serial.print(isnan(result.lat) ? 0.0 : result.lat, 4);
+    Serial.print(" lon=");
+    Serial.print(isnan(result.lon) ? 0.0 : result.lon, 4);
+    Serial.print(" alt=");
+    Serial.println(result.altitude_ft);
 
     // Capture a time reference so the display can compute elapsed time without
     // hitting WiFi.getTime() on every frame.
@@ -263,7 +277,8 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     // Location resolution:
     //   Airborne with position  → reverse-geocode live lat/lon via Nominatim.
     //   Landed, no position     → fall back to destination city/state.
-    //   Airborne, no position   → leave blank (VFR / no ADS-B coverage).
+    //   On ground (pre-depart)  → fall back to origin city/state.
+    //   Airborne, no position   → try GetLastTrack; leave blank if unavailable.
     if (!isnan(result.lat) && !isnan(result.lon))
     {
         Serial.print("TailTrackerFetcher: geocoding lat=");
@@ -311,21 +326,53 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     }
     else
     {
-        // Airborne but last_position is absent — try GetLastTrack for a more
-        // recent position update before giving up.
-        if (faFlightId.length() > 0)
+        // No position and not yet landed.  If the flight has not departed yet,
+        // show the origin airport city/region as the current location — the
+        // same pattern used for landed flights showing the destination.
+        if (result.actual_off_epoch == 0 && !f["origin"].isNull())
         {
+            JsonObject orig = f["origin"].as<JsonObject>();
+            Serial.println("TailTrackerFetcher: on ground, using origin location");
+
+            if (!orig["city"].isNull())
+                result.city = orig["city"].as<const char *>();
+            else if (!orig["name"].isNull())
+                result.city = orig["name"].as<const char *>();
+
+            if (!orig["state"].isNull())
+            {
+                const char *abbr = usStateAbbrev(orig["state"].as<const char *>());
+                result.region = abbr ? String(abbr) : safeStr(orig, "state");
+            }
+            else if (!orig["country_code"].isNull())
+            {
+                result.region = String(orig["country_code"].as<const char *>());
+                result.region.toUpperCase();
+            }
+
+            Serial.print("TailTrackerFetcher: origin city=");
+            Serial.print(result.city);
+            Serial.print(" region=");
+            Serial.println(result.region);
+        }
+        else if (faFlightId.length() > 0)
+        {
+            // Airborne but last_position is absent — try GetLastTrack.
             Serial.println("TailTrackerFetcher: airborne, trying GetLastTrack");
             double trackLat = NAN, trackLon = NAN;
-            if (fetchTrackPosition(faFlightId, trackLat, trackLon)
+            int    trackAlt = 0;
+            if (fetchTrackPosition(faFlightId, trackLat, trackLon, trackAlt)
                     && !isnan(trackLat) && !isnan(trackLon))
             {
-                result.lat = trackLat;
-                result.lon = trackLon;
+                result.lat          = trackLat;
+                result.lon          = trackLon;
+                result.altitude_ft  = trackAlt;
                 Serial.print("TailTrackerFetcher: track lat=");
                 Serial.print(result.lat, 4);
                 Serial.print(" lon=");
-                Serial.println(result.lon, 4);
+                Serial.print(result.lon, 4);
+                Serial.print(" alt=");
+                Serial.println(result.altitude_ft);
                 fetchReverseGeocode(result.lat, result.lon,
                                     result.city, result.region);
             }
@@ -350,7 +397,8 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
 // ---------------------------------------------------------------------------
 
 bool TailTrackerFetcher::fetchTrackPosition(const String &faFlightId,
-                                             double &outLat, double &outLon)
+                                             double &outLat, double &outLon,
+                                             int &outAlt)
 {
     if (strlen(APIConfiguration::AEROAPI_KEY) == 0) return false;
 
@@ -405,11 +453,11 @@ bool TailTrackerFetcher::fetchTrackPosition(const String &faFlightId,
         return false;
     }
 
-    // Filter: keep only lat/lon from every position entry so we can iterate
-    // to the last (most recent) one without blowing the heap.
+    // Filter: keep lat/lon/altitude from every position entry.
     JsonDocument trackFilter;
     trackFilter["positions"][0]["latitude"]  = true;
     trackFilter["positions"][0]["longitude"] = true;
+    trackFilter["positions"][0]["altitude"]  = true;
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload,
@@ -430,13 +478,18 @@ bool TailTrackerFetcher::fetchTrackPosition(const String &faFlightId,
     }
 
     // Positions are in ascending time order; the last element is the most recent.
+    // Note: the track endpoint returns altitude in hundreds of feet (flight
+    // levels), e.g. 360 = FL360 = 36,000 ft.  Multiply by 100 to get feet.
     double lastLat = NAN, lastLon = NAN;
+    int    lastAlt = 0;
     for (JsonObject pos : positions)
     {
         if (!pos["latitude"].isNull() && !pos["longitude"].isNull())
         {
             lastLat = pos["latitude"].as<double>();
             lastLon = pos["longitude"].as<double>();
+            if (!pos["altitude"].isNull())
+                lastAlt = pos["altitude"].as<int>() * 100;
         }
     }
 
@@ -444,6 +497,7 @@ bool TailTrackerFetcher::fetchTrackPosition(const String &faFlightId,
 
     outLat = lastLat;
     outLon = lastLon;
+    outAlt = lastAlt;
     return true;
 }
 

@@ -38,6 +38,10 @@ private:
     String truncateToColumns(const String &text, int maxColumns);
     void displaySingleFlightCard(const FlightInfo &f);
     void displayLoadingScreen();
+
+    // Draw a north-up compass rose centered at (cx, cy) with the given ring
+    // radius. The needle points toward bearingDeg (0 = north, 90 = east, etc.).
+    void drawCompass(int16_t cx, int16_t cy, int16_t radius, double bearingDeg);
 };
 #else
 // Stub so the file can be included in non-Protomatter builds without pulling
