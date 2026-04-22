@@ -417,6 +417,19 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
     bool isLanded   = status.actual_on_epoch  > 0;
     bool isAirborne = status.actual_off_epoch > 0 && !isLanded;
 
+    // Compass bearing fallback: when no live position is available, point toward
+    // the same location shown on line 3 — origin airport when pre-departure,
+    // destination airport when landed.
+    if (!hasPosition)
+    {
+        const double fbLat = isLanded ? status.dest_lat   : status.origin_lat;
+        const double fbLon = isLanded ? status.dest_lon   : status.origin_lon;
+        if (!isnan(fbLat) && !isnan(fbLon))
+            bearingDeg = computeBearingDeg(
+                UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+                fbLat, fbLon);
+    }
+
     // --- Line 1: status + destination ---
     // Use += with char literals instead of temporary String("x") objects to
     // avoid repeated small heap allocations on every display tick.
@@ -485,7 +498,27 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
         else if (isAirborne && currentEpoch >= status.actual_off_epoch)
             timeLine = formatElapsed(currentEpoch - status.actual_off_epoch, false);
         else
-            timeLine = "On Ground";
+        {
+            // Pre-departure: show T-minus countdown to scheduled departure
+            // when the time is known and still in the future.
+            if (status.scheduled_off_epoch > 0
+                    && status.actual_off_epoch == 0
+                    && status.scheduled_off_epoch > currentEpoch)
+            {
+                const unsigned long secsToGo = status.scheduled_off_epoch - currentEpoch;
+                const unsigned long minsRaw  = secsToGo / 60;
+                const int minsToGo = (int)(minsRaw  < 9999 ? minsRaw  : 9999);
+                const int hrsToGo  = (int)(minsRaw / 60 < 999 ? minsRaw / 60 : 999);
+                char tBuf[16];
+                if (hrsToGo >= 1)
+                    snprintf(tBuf, sizeof(tBuf), "T-%dh%dm", hrsToGo, minsToGo % 60);
+                else
+                    snprintf(tBuf, sizeof(tBuf), "T-%dm", minsToGo);
+                timeLine = String("On Ground ") + tBuf;
+            }
+            else
+                timeLine = "On Ground";
+        }
 
         if (hasPosition)
         {
@@ -510,6 +543,7 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
         locLine = status.region;
     else
         locLine = "---";
+    locLine.replace("County", "Cnty");
     locLine = clip(locLine, maxCols);
 
     // --- Colors ---
@@ -563,8 +597,9 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
     if (fillW > 0)
         _matrix->fillRect(0, 30, (int16_t)fillW, 2, barFg);
 
-    // --- Compass widget (right side, only when aircraft position is known) ---
-    if (hasPosition)
+    // --- Compass widget (right side, always shown in tracking mode) ---
+    // bearingDeg is 0.0 (north) when no position is available, which serves
+    // as a neutral default while the aircraft is on the ground or untracked.
     {
         const int16_t cx     = compassAreaX + 14; // horizontal center of compass area
         const int16_t cy     = (int16_t)(_matrixHeight / 2);

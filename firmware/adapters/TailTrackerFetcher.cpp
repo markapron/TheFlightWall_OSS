@@ -159,6 +159,8 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     filter["flights"][0]["progress_percent"] = true;
     filter["flights"][0]["actual_off"]       = true;
     filter["flights"][0]["actual_on"]        = true;
+    filter["flights"][0]["scheduled_off"]    = true;
+    filter["flights"][0]["scheduled_on"]     = true;
     filter["flights"][0]["last_position"]["latitude"]  = true;
     filter["flights"][0]["last_position"]["longitude"] = true;
     filter["flights"][0]["last_position"]["altitude"]  = true;
@@ -166,6 +168,8 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     filter["flights"][0]["origin"]["name"]              = true;
     filter["flights"][0]["origin"]["state"]             = true;
     filter["flights"][0]["origin"]["country_code"]      = true;
+    filter["flights"][0]["origin"]["latitude"]          = true;
+    filter["flights"][0]["origin"]["longitude"]         = true;
     filter["flights"][0]["destination"]["city"]         = true;
     filter["flights"][0]["destination"]["name"]         = true;
     filter["flights"][0]["destination"]["code_iata"]    = true;
@@ -173,6 +177,8 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     filter["flights"][0]["destination"]["code_lid"]     = true;
     filter["flights"][0]["destination"]["state"]        = true;
     filter["flights"][0]["destination"]["country_code"] = true;
+    filter["flights"][0]["destination"]["latitude"]     = true;
+    filter["flights"][0]["destination"]["longitude"]    = true;
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload,
@@ -192,20 +198,72 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
         return false;
     }
 
-    // For aircraft with multiple legs in the response (common on commercial/charter
-    // tail numbers), prefer the leg that has departed but not yet landed — that is
-    // the currently airborne flight.  Fall back to flights[0] if none qualifies.
-    int bestIdx = 0;
+    // Current epoch needed to rank upcoming scheduled legs.
+#if !defined(ARDUINO_ARCH_ESP32)
+    unsigned long nowEpoch = (unsigned long)WiFi.getTime();
+#else
+    unsigned long nowEpoch = (unsigned long)time(nullptr);
+#endif
+
+    // Pass 1: prefer the leg that is currently airborne (departed, not yet landed).
+    bool foundAirborne = false;
+    int  bestIdx       = 0;
     for (size_t i = 0; i < flights.size(); ++i)
     {
         // actual_off non-null  →  wheels have left the ground
         // actual_on  null      →  not yet landed
         if (!flights[i]["actual_off"].isNull() && flights[i]["actual_on"].isNull())
         {
-            bestIdx = (int)i;
+            bestIdx      = (int)i;
+            foundAirborne = true;
             break;
         }
     }
+
+    // Pass 2: no airborne leg — pick the leg whose scheduled window is closest
+    // to now, considering both scheduled_off and scheduled_on.  This shows
+    // recently-landed flights as well as upcoming departures.
+    if (!foundAirborne)
+    {
+        unsigned long bestDiff = ULONG_MAX;
+        for (size_t i = 0; i < flights.size(); ++i)
+        {
+            unsigned long minDiff = ULONG_MAX;
+
+            String scheduledOff = safeStr(flights[i], "scheduled_off");
+            if (scheduledOff.length() > 0)
+            {
+                unsigned long offEpoch = parseISO8601(scheduledOff);
+                if (offEpoch > 0)
+                {
+                    unsigned long d = offEpoch > nowEpoch
+                                    ? offEpoch - nowEpoch
+                                    : nowEpoch - offEpoch;
+                    if (d < minDiff) minDiff = d;
+                }
+            }
+
+            String scheduledOn = safeStr(flights[i], "scheduled_on");
+            if (scheduledOn.length() > 0)
+            {
+                unsigned long onEpoch = parseISO8601(scheduledOn);
+                if (onEpoch > 0)
+                {
+                    unsigned long d = onEpoch > nowEpoch
+                                    ? onEpoch - nowEpoch
+                                    : nowEpoch - onEpoch;
+                    if (d < minDiff) minDiff = d;
+                }
+            }
+
+            if (minDiff < bestDiff)
+            {
+                bestDiff = minDiff;
+                bestIdx  = (int)i;
+            }
+        }
+    }
+
     Serial.print("TailTrackerFetcher: using flights[");
     Serial.print(bestIdx);
     Serial.println("]");
@@ -228,8 +286,10 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
 
     String offStr = safeStr(f, "actual_off");
     String onStr  = safeStr(f, "actual_on");
-    result.actual_off_epoch = offStr.length() > 0 ? parseISO8601(offStr) : 0;
-    result.actual_on_epoch  = onStr.length()  > 0 ? parseISO8601(onStr)  : 0;
+    String schOffStr = safeStr(f, "scheduled_off");
+    result.actual_off_epoch    = offStr.length()    > 0 ? parseISO8601(offStr)    : 0;
+    result.actual_on_epoch     = onStr.length()     > 0 ? parseISO8601(onStr)     : 0;
+    result.scheduled_off_epoch = schOffStr.length() > 0 ? parseISO8601(schOffStr) : 0;
 
     // AeroAPI omits progress_percent once the flight has landed; treat as 100.
     if (result.actual_on_epoch > 0 && result.progress_percent == 0)
@@ -246,6 +306,15 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
             result.dest_code = dest["code_lid"].as<const char *>();
         else if (!dest["code_icao"].isNull())
             result.dest_code = dest["code_icao"].as<const char *>();
+        if (!dest["latitude"].isNull())  result.dest_lat = dest["latitude"].as<double>();
+        if (!dest["longitude"].isNull()) result.dest_lon = dest["longitude"].as<double>();
+    }
+
+    if (!f["origin"].isNull())
+    {
+        JsonObject orig = f["origin"].as<JsonObject>();
+        if (!orig["latitude"].isNull())  result.origin_lat = orig["latitude"].as<double>();
+        if (!orig["longitude"].isNull()) result.origin_lon = orig["longitude"].as<double>();
     }
 
     result.lat = NAN;

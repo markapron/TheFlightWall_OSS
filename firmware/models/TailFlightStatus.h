@@ -17,12 +17,21 @@ struct TailFlightStatus
     int progress_percent = 0;
 
     // Unix epoch seconds; 0 means the event has not occurred yet.
-    unsigned long actual_off_epoch = 0; // wheels up (takeoff)
-    unsigned long actual_on_epoch  = 0; // wheels down (landing)
+    unsigned long actual_off_epoch    = 0; // wheels up (takeoff)
+    unsigned long actual_on_epoch     = 0; // wheels down (landing)
+    unsigned long scheduled_off_epoch = 0; // scheduled departure (for T- countdown)
 
     // Last known position (NAN when unavailable).
     double lat = NAN;
     double lon = NAN;
+
+    // Airport positions used as compass bearing fallback when the aircraft has
+    // no live position.  Match what is shown on line 3 of the display:
+    // origin for pre-departure, destination for landed.  NAN when unavailable.
+    double origin_lat = NAN;
+    double origin_lon = NAN;
+    double dest_lat   = NAN;
+    double dest_lon   = NAN;
 
     // Altitude in feet from last_position; 0 when unavailable.
     int altitude_ft = 0;
