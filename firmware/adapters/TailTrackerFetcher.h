@@ -29,8 +29,18 @@ private:
     bool fetchTrackPosition(const String &faFlightId,
                             double &outLat, double &outLon, int &outAlt);
 
+    // Nominatim /search — one best hit; used to fill dest_lat/dest_lon for landed
+    // state when the AeroAPI object omits airport coordinates (compass bearing).
+    bool fetchForwardGeocodeForDestination(const String &searchQuery,
+                                            double &outLat, double &outLon);
+
     bool fetchReverseGeocode(double lat, double lon,
                              String &outCity, String &outRegion);
 
     static const char *usStateAbbrev(const char *fullName);
+
+    // Cache for forward geocode (identical query on each poll)
+    String _lastForwardQuery;
+    double _lastForwardLat = NAN;
+    double _lastForwardLon = NAN;
 };

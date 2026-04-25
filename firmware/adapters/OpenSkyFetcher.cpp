@@ -11,6 +11,7 @@ Outputs: Populates outStateVectors with filtered results (distance_km, bearing_d
 #include "adapters/OpenSkyFetcher.h"
 #include <ArduinoHttpClient.h>
 #include "utils/HttpUtils.h"
+#include "utils/MemoryUtils.h"
 
 // On ESP32, ArduinoHttpClient + WiFiClientSecure works correctly.
 // On SAMD/AirLift, we use WiFiSSLClient directly via wifiClientRequest() in HttpUtils,
@@ -80,6 +81,7 @@ bool OpenSkyFetcher::ensureAccessToken(bool forceRefresh)
     }
 
     m_accessToken = newToken;
+    flightwallStringDrop(newToken);
     m_tokenExpiryMs = newExpiryMs;
     Serial.print("OpenSkyFetcher: Token cached. Expires at ms: ");
     Serial.println((long)m_tokenExpiryMs);
@@ -180,18 +182,17 @@ bool OpenSkyFetcher::requestAccessToken(String &outToken, unsigned long &outExpi
     {
         Serial.print("OpenSkyFetcher: Token JSON parse error: ");
         Serial.println(err.c_str());
-        Serial.print("OpenSkyFetcher: Raw token response: ");
-        Serial.println(payload);
+        doc.clear();
+        flightwallStringDrop(payload);
         return false;
     }
+    flightwallStringDrop(payload);
 
     String tokenStr = doc["access_token"].as<String>();
     int expiresIn = doc["expires_in"] | 1800; // seconds; default 30min
     if (tokenStr.length() == 0)
     {
         Serial.println("OpenSkyFetcher: access_token missing in response");
-        Serial.print("OpenSkyFetcher: Full response: ");
-        Serial.println(payload);
         if (doc.is<JsonObject>())
         {
             Serial.println("OpenSkyFetcher: Response keys:");
@@ -201,11 +202,14 @@ bool OpenSkyFetcher::requestAccessToken(String &outToken, unsigned long &outExpi
                 Serial.println(kv.key().c_str());
             }
         }
+        doc.clear();
         return false;
     }
 
     outToken = tokenStr;
     outExpiryMs = millis() + (unsigned long)expiresIn * 1000UL;
+    doc.clear();
+    flightwallStringDrop(tokenStr);
     Serial.print("OpenSkyFetcher: Obtained access token, length: ");
     Serial.println((int)outToken.length());
     Serial.print("OpenSkyFetcher: Token expires in (s): ");
@@ -286,7 +290,7 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
     // 401: token may have expired — refresh and retry once
     if (code == 401 && m_accessToken.length() > 0 && ensureAccessToken(true))
     {
-        payload = "";
+        flightwallStringDrop(payload);
         if (!doStatesGet())
         {
             Serial.println("OpenSkyFetcher: States GET retry failed after token refresh");
@@ -304,22 +308,25 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
     // The OpenSky states response is ~20-25 KB of JSON. ArduinoJson needs roughly
     // 1.5x the raw JSON size for its internal representation. 48 KB is safe on the
     // SAMD51's 192 KB of RAM, provided we free the raw payload string first.
+    const size_t payloadBytes = payload.length();
     DynamicJsonDocument doc(49152);
     DeserializationError err = deserializeJson(doc, payload);
-    payload = String(); // free ~21 KB before iterating the doc tree
+    flightwallStringDrop(payload);
     if (err)
     {
         Serial.print("OpenSkyFetcher: JSON deserialization error: ");
         Serial.print(err.c_str());
         Serial.print(" (payload length: ");
-        Serial.print(payload.length());
+        Serial.print((unsigned)payloadBytes);
         Serial.println(")");
+        doc.clear();
         return false;
     }
 
     JsonArray states = doc["states"].as<JsonArray>();
     if (states.isNull())
     {
+        doc.clear();
         return true; // no states is not an error
     }
 
@@ -371,5 +378,6 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
         outStateVectors.push_back(s);
     }
 
+    doc.clear();
     return true;
 }

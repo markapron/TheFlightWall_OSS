@@ -1,4 +1,5 @@
 #include "utils/HttpUtils.h"
+#include "utils/MemoryUtils.h"
 
 WifiClientTickFn wifiClientTick = nullptr;
 
@@ -20,7 +21,7 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
                        const String &body, int &outCode, String &outPayload)
 {
     outCode = -1;
-    outPayload = "";
+    flightwallStringDrop(outPayload);
 
 #if defined(FLIGHTWALL_SKIP_TLS)
     WiFiClient client;
@@ -97,26 +98,29 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
     {
         outCode = statusLine.substring(sp + 1, sp + 4).toInt();
     }
+    flightwallStringDrop(statusLine);
 
     // Read response headers, detect Transfer-Encoding: chunked.
+    // Reuse one String to avoid a header-sized allocation per line on small heaps.
     // tick() is called on every iteration so button presses and display updates
     // are not frozen while a slow server delivers headers one at a time.
-    bool isChunked = false;
+    String headerLine;
+    bool  isChunked = false;
     while (client.connected() || client.available())
     {
         tick();
-        String line = client.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0)
+        headerLine = client.readStringUntil('\n');
+        headerLine.trim();
+        if (headerLine.length() == 0)
             break; // blank line = end of headers
-        String lower = line;
-        lower.toLowerCase();
-        if (lower.indexOf("transfer-encoding") >= 0 && lower.indexOf("chunked") >= 0)
+        headerLine.toLowerCase();
+        if (headerLine.indexOf("transfer-encoding") >= 0 && headerLine.indexOf("chunked") >= 0)
         {
             isChunked = true;
             Serial.println("wifiClientRequest: chunked transfer encoding detected");
         }
     }
+    flightwallStringDrop(headerLine);
 
     // For error responses, cap body at 512 bytes — enough for a useful error message
     // but prevents spending seconds reading a 27 KB CDN HTML error page.
@@ -128,12 +132,13 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
         // Decode HTTP/1.1 chunked body:
         // Each chunk is preceded by its size in hex on its own line, followed by \r\n,
         // then the chunk data, then another \r\n. A zero-size chunk signals the end.
+        String sizeLine;
         while (client.connected() || client.available())
         {
             if (outPayload.length() >= maxBodyBytes)
                 break; // body limit reached — close early
 
-            String sizeLine = client.readStringUntil('\n');
+            sizeLine = client.readStringUntil('\n');
             sizeLine.trim();
             if (sizeLine.length() == 0)
                 continue; // skip blank lines between chunks
@@ -192,6 +197,7 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
             }
             client.readStringUntil('\n'); // consume trailing \r\n after chunk data
         }
+        flightwallStringDrop(sizeLine);
     }
     else
     {
@@ -230,7 +236,7 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
 
     // Free memory used by large error-page bodies that the caller will discard anyway
     if (outCode < 200 || outCode >= 300)
-        outPayload = String();
+        flightwallStringDrop(outPayload);
 
     return true;
 }

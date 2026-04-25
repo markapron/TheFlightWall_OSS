@@ -1,10 +1,12 @@
 /*
 Purpose: Fetch real-time status for a tracked tail number from AeroAPI and
-         reverse-geocode the aircraft position using Nominatim.
+         use Nominatim for both reverse- (aircraft) and forward- (arrival) geocodes.
 Responsibilities:
 - GET /flights/{ident} from AeroAPI; parse status, progress, timestamps, last position.
-- GET Nominatim reverse-geocode for city/state/country from last position.
-- Cache geocode results so Nominatim is not called more often than necessary.
+- GET Nominatim /reverse for city/state from live lat/lon when available.
+- GET Nominatim /search to resolve arrival city/dest code to dest_lat/dest_lon when
+  landed and the API omits destination airport coordinates (compass on Matrix display).
+- Cache results where appropriate to limit rate to Nominatim.
 */
 #include "adapters/TailTrackerFetcher.h"
 
@@ -14,6 +16,7 @@ Responsibilities:
 #include "config/TailTrackerConfiguration.h"
 #include "utils/HttpUtils.h"
 #include "utils/GeoUtils.h"
+#include "utils/MemoryUtils.h"
 
 #if defined(ARDUINO_ARCH_ESP32)
   #if defined(FLIGHTWALL_SKIP_TLS)
@@ -74,6 +77,18 @@ static String safeStr(JsonVariant v, const char *key)
 {
     if (v[key].isNull()) return String("");
     return String(v[key].as<const char *>());
+}
+
+// AeroAPI sometimes omits a real last_position and sends 0,0. That is not a valid
+// aircraft fix; treat it as missing so we fall through to GetLastTrack and pick up
+// city/region from the track + Nominatim path instead of geocoding the Gulf of Guinea.
+static bool hasPlausibleAircraftPosition(double lat, double lon)
+{
+    if (isnan(lat) || isnan(lon))
+        return false;
+    if (lat == 0.0 && lon == 0.0)
+        return false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -149,9 +164,16 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
         return false;
     }
 
+    // Parsed /flights document can be 10–30 KB.  GetLastTrack and Nominatim each
+    // add another large buffer — keep those requests out of the same live range
+    // as `doc` so the heap is not left ~30 KB below the pre-fetch watermark.
+    TailFlightStatus result;
+    String           faIdForTrack;
+
     // Build a filter so ArduinoJson only allocates the handful of fields we
     // actually use from flights[0].  The full response can be 15+ flights with
     // ~50 fields each; the filter cuts parse time and RAM use dramatically.
+    {
     JsonDocument filter;
     filter["flights"][0]["fa_flight_id"]     = true;
     filter["flights"][0]["ident"]            = true;
@@ -183,7 +205,7 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload,
                                                DeserializationOption::Filter(filter));
-    payload = String(); // free before using doc
+    flightwallStringDrop(payload);
     if (err)
     {
         Serial.print("TailTrackerFetcher: JSON parse error: ");
@@ -270,8 +292,6 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
 
     JsonObject f = flights[bestIdx].as<JsonObject>();
 
-    TailFlightStatus result;
-    const String faFlightId = safeStr(f, "fa_flight_id");
     result.ident  = safeStr(f, "ident");
     result.status = safeStr(f, "status");
 
@@ -343,62 +363,47 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
 #endif
     result.fetch_millis = millis();
 
-    // Location resolution:
-    //   Airborne with position  → reverse-geocode live lat/lon via Nominatim.
-    //   Landed, no position     → fall back to destination city/state.
-    //   On ground (pre-depart)  → fall back to origin city/state.
-    //   Airborne, no position   → try GetLastTrack; leave blank if unavailable.
-    if (!isnan(result.lat) && !isnan(result.lon))
+    // City/region from JSON only, while `f` and JsonDocument are still valid
+    // (GetLastTrack + Nominatim must not run in the same scope as /flights doc).
     {
-        Serial.print("TailTrackerFetcher: geocoding lat=");
-        Serial.print(result.lat, 4);
-        Serial.print(" lon=");
-        Serial.println(result.lon, 4);
-        fetchReverseGeocode(result.lat, result.lon, result.city, result.region);
-    }
-    else if (result.actual_on_epoch > 0)
-    {
-        // Flight has landed — show the destination as the current location.
-        Serial.println("TailTrackerFetcher: landed, no position — using destination");
-        if (!f["destination"].isNull())
+        const bool hasLivePos = hasPlausibleAircraftPosition(result.lat, result.lon);
+
+        if (!hasLivePos && result.actual_on_epoch > 0)
         {
-            JsonObject dest = f["destination"].as<JsonObject>();
-
-            // city → airport name → ICAO code, whichever is non-null first.
-            if (!dest["city"].isNull())
-                result.city = dest["city"].as<const char *>();
-            else if (!dest["name"].isNull())
-                result.city = dest["name"].as<const char *>();
-            else if (!dest["code_icao"].isNull())
-                result.city = dest["code_icao"].as<const char *>();
-
-            if (!dest["state"].isNull())
+            Serial.println("TailTrackerFetcher: landed, no position — using destination");
+            if (!f["destination"].isNull())
             {
-                const char *abbr = usStateAbbrev(dest["state"].as<const char *>());
-                result.region = abbr ? String(abbr) : safeStr(dest, "state");
-            }
-            else if (!dest["country_code"].isNull())
-            {
-                result.region = String(dest["country_code"].as<const char *>());
-                result.region.toUpperCase();
-            }
+                JsonObject dest = f["destination"].as<JsonObject>();
+                if (!dest["city"].isNull())
+                    result.city = dest["city"].as<const char *>();
+                else if (!dest["name"].isNull())
+                    result.city = dest["name"].as<const char *>();
+                else if (!dest["code_icao"].isNull())
+                    result.city = dest["code_icao"].as<const char *>();
 
-            Serial.print("TailTrackerFetcher: dest city=");
-            Serial.print(result.city);
-            Serial.print(" region=");
-            Serial.println(result.region);
+                if (!dest["state"].isNull())
+                {
+                    const char *abbr = usStateAbbrev(dest["state"].as<const char *>());
+                    result.region = abbr ? String(abbr) : safeStr(dest, "state");
+                }
+                else if (!dest["country_code"].isNull())
+                {
+                    result.region = String(dest["country_code"].as<const char *>());
+                    result.region.toUpperCase();
+                }
+
+                Serial.print("TailTrackerFetcher: dest city=");
+                Serial.print(result.city);
+                Serial.print(" region=");
+                Serial.println(result.region);
+            }
+            else
+            {
+                Serial.println("TailTrackerFetcher: destination is null");
+            }
         }
-        else
-        {
-            Serial.println("TailTrackerFetcher: destination is null");
-        }
-    }
-    else
-    {
-        // No position and not yet landed.  If the flight has not departed yet,
-        // show the origin airport city/region as the current location — the
-        // same pattern used for landed flights showing the destination.
-        if (result.actual_off_epoch == 0 && !f["origin"].isNull())
+        else if (!hasLivePos && result.actual_off_epoch == 0
+                 && !f["origin"].isNull())
         {
             JsonObject orig = f["origin"].as<JsonObject>();
             Serial.println("TailTrackerFetcher: on ground, using origin location");
@@ -424,18 +429,41 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
             Serial.print(" region=");
             Serial.println(result.region);
         }
-        else if (faFlightId.length() > 0)
+    }
+
+    faIdForTrack = safeStr(f, "fa_flight_id");
+    } // end scope: free filter + doc before /track or Nominatim (heap watermark)
+
+    // Location resolution (network) — /flights JsonDocument is gone.
+    if (hasPlausibleAircraftPosition(result.lat, result.lon))
+    {
+        Serial.print("TailTrackerFetcher: geocoding lat=");
+        Serial.print(result.lat, 4);
+        Serial.print(" lon=");
+        Serial.println(result.lon, 4);
+        fetchReverseGeocode(result.lat, result.lon, result.city, result.region);
+    }
+    else if (result.actual_on_epoch > 0)
+    {
+        // city/region from destination in JSON, set above
+    }
+    else
+    {
+        if (result.actual_off_epoch == 0)
         {
-            // Airborne but last_position is absent — try GetLastTrack.
+            // on ground: city/region from origin in JSON, set above (if any)
+        }
+        else if (faIdForTrack.length() > 0)
+        {
             Serial.println("TailTrackerFetcher: airborne, trying GetLastTrack");
             double trackLat = NAN, trackLon = NAN;
             int    trackAlt = 0;
-            if (fetchTrackPosition(faFlightId, trackLat, trackLon, trackAlt)
+            if (fetchTrackPosition(faIdForTrack, trackLat, trackLon, trackAlt)
                     && !isnan(trackLat) && !isnan(trackLon))
             {
-                result.lat          = trackLat;
-                result.lon          = trackLon;
-                result.altitude_ft  = trackAlt;
+                result.lat         = trackLat;
+                result.lon         = trackLon;
+                result.altitude_ft = trackAlt;
                 Serial.print("TailTrackerFetcher: track lat=");
                 Serial.print(result.lat, 4);
                 Serial.print(" lon=");
@@ -453,6 +481,42 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
         else
         {
             Serial.println("TailTrackerFetcher: no fa_flight_id, cannot fetch track");
+        }
+    }
+
+    // Landed: destination airport may omit lat/lon in the AeroAPI payload; the
+    // line-3 text is still set from the destination city/region. Forward-geocode
+    // that (or the dest code) so dest_lat/dest_lon feed the compass fallback.
+    if (result.actual_on_epoch > 0
+        && (isnan(result.dest_lat) || isnan(result.dest_lon)))
+    {
+        String gq;
+        if (result.city.length() > 0)
+        {
+            gq = result.city;
+            if (result.region.length() > 0)
+            {
+                gq += ", ";
+                gq += result.region;
+            }
+        }
+        else if (result.dest_code.length() > 0)
+        {
+            gq = result.dest_code;
+        }
+        if (gq.length() > 0)
+        {
+            double fla, flo;
+            if (fetchForwardGeocodeForDestination(gq, fla, flo)
+                    && hasPlausibleAircraftPosition(fla, flo))
+            {
+                result.dest_lat = fla;
+                result.dest_lon = flo;
+                Serial.print("TailTrackerFetcher: forward geocode dest ");
+                Serial.print(fla, 4);
+                Serial.print(",");
+                Serial.println(flo, 4);
+            }
         }
     }
 
@@ -531,7 +595,7 @@ bool TailTrackerFetcher::fetchTrackPosition(const String &faFlightId,
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload,
                                                DeserializationOption::Filter(trackFilter));
-    payload = String();
+    flightwallStringDrop(payload);
     if (err)
     {
         Serial.print("TailTrackerFetcher: track JSON parse error: ");
@@ -543,6 +607,7 @@ bool TailTrackerFetcher::fetchTrackPosition(const String &faFlightId,
     if (positions.isNull() || positions.size() == 0)
     {
         Serial.println("TailTrackerFetcher: track positions array empty");
+        doc.clear();
         return false;
     }
 
@@ -562,11 +627,153 @@ bool TailTrackerFetcher::fetchTrackPosition(const String &faFlightId,
         }
     }
 
-    if (isnan(lastLat) || isnan(lastLon)) return false;
+    if (isnan(lastLat) || isnan(lastLon))
+    {
+        doc.clear();
+        return false;
+    }
 
     outLat = lastLat;
     outLon = lastLon;
     outAlt = lastAlt;
+    doc.clear();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// URL-encode a string for a Nominatim query= parameter.
+// ---------------------------------------------------------------------------
+
+static void appendUrlQueryEncoded(const String &s, String &out)
+{
+    for (size_t i = 0; i < s.length(); ++i)
+    {
+        const unsigned char c = (unsigned char)s[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+            || c == '-' || c == '_' || c == '.')
+        {
+            out += (char)c;
+        }
+        else if (c == ' ')
+        {
+            out += '+';
+        }
+        else
+        {
+            char buf[5];
+            snprintf(buf, sizeof(buf), "%%%02X", (unsigned int)c);
+            out += buf;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Forward geocoding via Nominatim /search (arrival city → lat/lon for compass)
+// ---------------------------------------------------------------------------
+
+bool TailTrackerFetcher::fetchForwardGeocodeForDestination(const String &searchQuery,
+                                                            double &outLat, double &outLon)
+{
+    if (searchQuery.length() == 0)
+        return false;
+
+    if (searchQuery == _lastForwardQuery
+        && !isnan(_lastForwardLat) && !isnan(_lastForwardLon))
+    {
+        outLat = _lastForwardLat;
+        outLon = _lastForwardLon;
+        return true;
+    }
+
+    String path = String("/search?format=json&limit=1&q=");
+    appendUrlQueryEncoded(searchQuery, path);
+    if (path.length() > 512)
+    {
+        Serial.println("TailTrackerFetcher: forward geocode query too long");
+        return false;
+    }
+
+    const String   host = "nominatim.openstreetmap.org";
+    const uint16_t port = 443;
+
+    int    code = -1;
+    String payload;
+
+#if defined(ARDUINO_ARCH_ESP32)
+    {
+        TailTlsClient net;
+#if !defined(FLIGHTWALL_SKIP_TLS)
+        net.setInsecure();
+#endif
+        HttpClient http(net, host.c_str(), port);
+        http.setHttpResponseTimeout(15000);
+        http.beginRequest();
+        http.get(path);
+        http.sendHeader("User-Agent", "FlightWallFirmware/1.0");
+        http.sendHeader("Accept",     "application/json");
+        http.endRequest();
+        code    = http.responseStatusCode();
+        payload = http.responseBody();
+    }
+#else
+    {
+        const String hdrs =
+            "User-Agent: FlightWallFirmware/1.0\r\nAccept: application/json\r\n";
+        if (!wifiClientRequest("GET", host, port, path, hdrs, "", code, payload))
+        {
+            Serial.println("TailTrackerFetcher: Nominatim /search failed");
+            return false;
+        }
+    }
+#endif
+
+    if (code != 200)
+    {
+        Serial.print("TailTrackerFetcher: Nominatim /search HTTP ");
+        Serial.println(code);
+        return false;
+    }
+
+    // First hit only: keep parse cost and RAM small.
+    JsonDocument searchFilter;
+    searchFilter[0]["lat"] = true;
+    searchFilter[0]["lon"] = true;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload,
+                                             DeserializationOption::Filter(searchFilter));
+    flightwallStringDrop(payload);
+    if (err)
+    {
+        Serial.println("TailTrackerFetcher: Nominatim /search JSON parse error");
+        return false;
+    }
+
+    JsonArray hits = doc.as<JsonArray>();
+    if (hits.isNull() || hits.size() == 0)
+    {
+        Serial.println("TailTrackerFetcher: Nominatim /search: no results");
+        doc.clear();
+        return false;
+    }
+
+    JsonObject first = hits[0].as<JsonObject>();
+    if (first["lat"].isNull() || first["lon"].isNull())
+    {
+        doc.clear();
+        return false;
+    }
+
+    outLat = first["lat"].as<double>();
+    outLon = first["lon"].as<double>();
+    doc.clear();
+
+    if (isnan(outLat) || isnan(outLon))
+        return false;
+
+    _lastForwardQuery = searchQuery;
+    _lastForwardLat   = outLat;
+    _lastForwardLon   = outLon;
     return true;
 }
 
@@ -637,7 +844,7 @@ bool TailTrackerFetcher::fetchReverseGeocode(double lat, double lon,
 
     JsonDocument geo;
     DeserializationError err = deserializeJson(geo, payload);
-    payload = String();
+    flightwallStringDrop(payload);
     if (err)
     {
         Serial.println("TailTrackerFetcher: Nominatim JSON parse error");
@@ -679,6 +886,7 @@ bool TailTrackerFetcher::fetchReverseGeocode(double lat, double lon,
     _lastCity   = city;
     _lastRegion = region;
 
+    geo.clear();
     return true;
 }
 

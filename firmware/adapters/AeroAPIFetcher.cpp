@@ -10,6 +10,7 @@ Output: Populates FlightInfo on success and returns true.
 #include "adapters/AeroAPIFetcher.h"
 #include <ArduinoHttpClient.h>
 #include "utils/HttpUtils.h"
+#include "utils/MemoryUtils.h"
 
 static String safeGetString(JsonVariant v, const char *key)
 {
@@ -87,10 +88,11 @@ bool AeroAPIFetcher::fetchFlightInfo(const String &flightIdent, FlightInfo &outI
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
-    payload = String(); // free ~25 KB before extracting fields from doc
+    flightwallStringDrop(payload);
     if (err)
     {
         Serial.printf("AeroAPIFetcher: JSON parsing failed for flight %s: %s\n", flightIdent.c_str(), err.c_str());
+        doc.clear();
         return false;
     }
 
@@ -98,6 +100,7 @@ bool AeroAPIFetcher::fetchFlightInfo(const String &flightIdent, FlightInfo &outI
     if (flights.isNull() || flights.size() == 0)
     {
         Serial.printf("AeroAPIFetcher: No flights found in response for %s\n", flightIdent.c_str());
+        doc.clear();
         return false;
     }
 
@@ -124,5 +127,17 @@ bool AeroAPIFetcher::fetchFlightInfo(const String &flightIdent, FlightInfo &outI
         outInfo.destination.code_iata = safeGetString(d, "code_iata");
     }
 
+    outInfo.progress_percent = 0;
+    if (!f["progress_percent"].isNull())
+        outInfo.progress_percent = f["progress_percent"].as<int>();
+
+    // AeroAPI often omits progress_percent once the flight has landed.
+    {
+        const String actualOn = safeGetString(f, "actual_on");
+        if (actualOn.length() > 0 && outInfo.progress_percent == 0)
+            outInfo.progress_percent = 100;
+    }
+
+    doc.clear();
     return true;
 }

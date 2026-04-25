@@ -217,6 +217,22 @@ void NeoMatrixDisplay::displaySingleFlightCard(const FlightInfo &f)
 
     // Line 3
     drawTextLine(startX, y, line3, line3Color);
+
+    // Route progress (AeroAPI); same colors as tail-tracker bar.
+    const uint16_t barBg = _matrix->Color(DisplayConfiguration::TAIL_BAR_BG_R,
+                                          DisplayConfiguration::TAIL_BAR_BG_G,
+                                          DisplayConfiguration::TAIL_BAR_BG_B);
+    const uint16_t barFg = _matrix->Color(DisplayConfiguration::TAIL_BAR_FG_R,
+                                          DisplayConfiguration::TAIL_BAR_FG_G,
+                                          DisplayConfiguration::TAIL_BAR_FG_B);
+    _matrix->fillRect(0, 30, _matrixWidth, 2, barBg);
+    int prog = f.progress_percent;
+    if (prog < 0) prog = 0;
+    if (prog > 100) prog = 100;
+    int fillW = (prog * (int)_matrixWidth) / 100;
+    if (fillW > (int)_matrixWidth) fillW = (int)_matrixWidth;
+    if (fillW > 0)
+        _matrix->fillRect(0, 30, fillW, 2, barFg);
 }
 
 void NeoMatrixDisplay::displayFlights(const std::vector<FlightInfo> &flights)

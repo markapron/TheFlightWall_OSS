@@ -4,7 +4,8 @@ Responsibilities:
 - Initialize serial, connect to Wi‑Fi, and construct fetchers and display.
 - Handle UP/DOWN button presses to switch between operating modes.
 - MODE_NEARBY: periodically fetch nearby state vectors and enrich with AeroAPI;
-  cycle through the resulting flight cards on the display.
+  cycle through flight cards with route progress and a bearing compass like tail
+  tracker (layout on HUB75 / Protomatter).
 - MODE_TAIL_TRACKER: periodically fetch status (progress, time, position) for a
   configured tail number and show a dedicated tracker screen with a progress bar
   and reverse-geocoded city/state.
@@ -29,6 +30,8 @@ Configuration: UserConfiguration, TailTrackerConfiguration, TimingConfiguration,
 #include "core/FlightDataFetcher.h"
 #include "models/TailFlightStatus.h"
 #include "utils/HttpUtils.h"
+#include "utils/MemoryUtils.h"
+#include "utils/RamStats.h"
 #if defined(FLIGHTWALL_DISPLAY_NEOMATRIX)
 #include "adapters/NeoMatrixDisplay.h"
 using ActiveDisplay = NeoMatrixDisplay;
@@ -55,18 +58,18 @@ enum AppMode
 // reachable via the UP-button cycle.
 static const int kCycleModeCount = 2;
 
-static AppMode g_appMode      = MODE_NEARBY;
+static AppMode g_appMode      = MODE_TAIL_TRACKER;
 static AppMode g_prevActiveMode = MODE_NEARBY; // mode to restore after sleep/config
 
 // ---------------------------------------------------------------------------
 // Global objects
 // ---------------------------------------------------------------------------
 
-static OpenSkyFetcher    g_openSky;
-static AeroAPIFetcher    g_aeroApi;
+static OpenSkyFetcher     g_openSky;
+static AeroAPIFetcher     g_aeroApi;
 static TailTrackerFetcher g_tailFetcher;
-static FlightDataFetcher *g_fetcher = nullptr;
-static ActiveDisplay     g_display;
+static FlightDataFetcher  g_flightDataFetcher(&g_openSky, &g_aeroApi);
+static ActiveDisplay      g_display;
 
 // MODE_NEARBY state
 static std::vector<FlightInfo> g_cachedFlights;
@@ -74,7 +77,9 @@ static unsigned long           g_lastFetchMs = 0;
 
 // MODE_TAIL_TRACKER state
 static TailFlightStatus  g_tailStatus;
-static unsigned long     g_lastTailFetchMs = 0;
+static unsigned long     g_lastTailFetchMs  = 0;
+static unsigned long     g_lastTailRedrawMs = 0;
+static unsigned long     g_lastMemLogMs     = 0;
 
 // ---------------------------------------------------------------------------
 // Button handling — forward declaration so displayTick can call it
@@ -84,6 +89,28 @@ static void checkButtons();
 // ---------------------------------------------------------------------------
 // Display tick (called during blocking HTTP/TLS waits)
 // ---------------------------------------------------------------------------
+
+// Full tail-matrix redraw: rate-limited to reduce heap churn (see
+// TailTrackerConfiguration::DISPLAY_REDRAW_MIN_MS). Use force after a new fetch
+// or when changing modes.
+static void tailTrackerRedrawIfDue(bool force)
+{
+    if (g_appMode != MODE_TAIL_TRACKER)
+        return;
+
+    const unsigned long now = millis();
+    if (!force && g_lastTailRedrawMs != 0 &&
+        (now - g_lastTailRedrawMs) < TailTrackerConfiguration::DISPLAY_REDRAW_MIN_MS)
+    {
+        return;
+    }
+    g_lastTailRedrawMs = now;
+
+    if (g_tailStatus.valid)
+        g_display.displayTailTracker(g_tailStatus);
+    else
+        g_display.displayTailLoading();
+}
 
 static void displayTick()
 {
@@ -96,12 +123,7 @@ static void displayTick()
         return;
 
     if (g_appMode == MODE_TAIL_TRACKER)
-    {
-        if (g_tailStatus.valid)
-            g_display.displayTailTracker(g_tailStatus);
-        else
-            g_display.displayTailLoading();
-    }
+        tailTrackerRedrawIfDue(false);
     else
     {
         g_display.displayFlights(g_cachedFlights);
@@ -148,6 +170,11 @@ static void checkButtons()
             g_appMode = g_prevActiveMode;
             g_lastFetchMs     = 0;
             g_lastTailFetchMs = 0;
+            if (g_appMode == MODE_TAIL_TRACKER)
+            {
+                g_lastTailRedrawMs = 0;
+                g_lastMemLogMs     = 0;
+            }
             Serial.print(F("UP: restored mode → "));
             Serial.println(g_appMode == MODE_TAIL_TRACKER ? "TAIL_TRACKER" : "NEARBY");
         }
@@ -163,6 +190,8 @@ static void checkButtons()
                 if (g_appMode == MODE_TAIL_TRACKER)
                 {
                     if (!g_tailStatus.valid) g_lastTailFetchMs = 0;
+                    g_lastTailRedrawMs = 0;
+                    g_lastMemLogMs     = 0;
                 }
                 else
                 {
@@ -190,6 +219,11 @@ static void checkButtons()
             g_appMode        = g_prevActiveMode;
             g_lastFetchMs     = 0;
             g_lastTailFetchMs = 0;
+            if (g_appMode == MODE_TAIL_TRACKER)
+            {
+                g_lastTailRedrawMs = 0;
+                g_lastMemLogMs     = 0;
+            }
             Serial.println(F("DOWN: waking up."));
         }
         else if (g_appMode != MODE_SERIAL_CONFIG)
@@ -370,7 +404,6 @@ void setup()
         }
     }
 
-    g_fetcher = new FlightDataFetcher(&g_openSky, &g_aeroApi);
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +416,20 @@ void loop()
 
     SerialConfig::tick();
     checkButtons();
+
+    // Drop the other mode’s heavy String-backed cache when switching views so
+    // nearby + tail never hold two full datasets at once.
+    {
+        static AppMode s_lastMode = static_cast<AppMode>(255);
+        if (g_appMode != s_lastMode)
+        {
+            if (g_appMode == MODE_TAIL_TRACKER)
+                flightwallVectorDrop(g_cachedFlights);
+            else if (g_appMode == MODE_NEARBY)
+                g_tailStatus = TailFlightStatus();
+            s_lastMode = g_appMode;
+        }
+    }
 
     // --- MODE_SLEEP / MODE_SERIAL_CONFIG: do nothing (no fetch, no display) ---
     if (g_appMode == MODE_SLEEP)
@@ -399,6 +446,11 @@ void loop()
             g_appMode = g_prevActiveMode;
             g_lastFetchMs     = 0;
             g_lastTailFetchMs = 0;
+            if (g_appMode == MODE_TAIL_TRACKER)
+            {
+                g_lastTailRedrawMs = 0;
+                g_lastMemLogMs     = 0;
+            }
             Serial.println(F("Serial config closed — resuming normal operation."));
         }
         delay(10);
@@ -414,7 +466,7 @@ void loop()
         {
             std::vector<StateVector> states;
             std::vector<FlightInfo>  flights;
-            size_t enriched = g_fetcher->fetchFlights(states, flights);
+            size_t enriched = g_flightDataFetcher.fetchFlights(states, flights);
 
             Serial.print("OpenSky state vectors: ");
             Serial.println((int)states.size());
@@ -475,6 +527,7 @@ void loop()
                     SerialConfig::tailNumber.c_str(), newStatus))
             {
                 g_tailStatus = newStatus;
+                tailTrackerRedrawIfDue(true);
                 Serial.print("TailTracker: status=");
                 Serial.print(g_tailStatus.status);
                 Serial.print(" progress=");
@@ -497,10 +550,19 @@ void loop()
         // Re-check mode for the same reason as above.
         if (g_appMode == MODE_TAIL_TRACKER)
         {
-            if (g_tailStatus.valid)
-                g_display.displayTailTracker(g_tailStatus);
-            else
-                g_display.displayTailLoading();
+            tailTrackerRedrawIfDue(false);
+
+            if (TailTrackerConfiguration::MEM_LOG_INTERVAL_MS > 0 &&
+                (g_lastMemLogMs == 0 ||
+                 now - g_lastMemLogMs >= TailTrackerConfiguration::MEM_LOG_INTERVAL_MS))
+            {
+                g_lastMemLogMs     = now;
+                const size_t bytes = flightwallApproxFreeBytes();
+                Serial.print(F("[tail] approx free bytes="));
+                Serial.print((unsigned long)bytes);
+                Serial.print(F(" redraw_min_ms="));
+                Serial.println((unsigned long)TailTrackerConfiguration::DISPLAY_REDRAW_MIN_MS);
+            }
         }
     }
 

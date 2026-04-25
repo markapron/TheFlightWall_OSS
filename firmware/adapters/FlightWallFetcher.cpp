@@ -9,6 +9,7 @@ Outputs: Display name strings (short/full) via out parameters.
 #include "adapters/FlightWallFetcher.h"
 #include <ArduinoHttpClient.h>
 #include "utils/HttpUtils.h"
+#include "utils/MemoryUtils.h"
 
 // On ESP32, ArduinoHttpClient + WiFiClientSecure is used directly.
 // On SAMD/AirLift, wifiClientRequest() in HttpUtils handles the TLS connection.
@@ -84,7 +85,11 @@ bool FlightWallFetcher::getAirlineName(const String &airlineIcao, String &outDis
     StaticJsonDocument<256> doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (err)
+    {
+        flightwallStringDrop(payload);
         return false;
+    }
+    flightwallStringDrop(payload);
 
     if (doc.containsKey("display_name_full"))
     {
@@ -111,7 +116,11 @@ bool FlightWallFetcher::getAircraftName(const String &aircraftIcao,
     StaticJsonDocument<256> doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (err)
+    {
+        flightwallStringDrop(payload);
         return false;
+    }
+    flightwallStringDrop(payload);
 
     if (doc.containsKey("display_name_short"))
     {

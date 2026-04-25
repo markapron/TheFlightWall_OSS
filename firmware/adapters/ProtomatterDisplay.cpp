@@ -2,7 +2,8 @@
 Purpose: Render flight info on a HUB75 RGB matrix via Adafruit_Protomatter.
 Responsibilities:
 - Initialize RGB matrix based on HardwareConfiguration and user display settings.
-- Render a bordered, three-line flight “card” and a minimal loading screen.
+- Render nearby flight cards (three text lines, compass, route progress bar) and a
+  minimal loading screen; tail-tracker screen with the same compass/bar widgets.
 - Cycle through multiple flights at a configurable interval.
 */
 #include "adapters/ProtomatterDisplay.h"
@@ -137,18 +138,12 @@ String ProtomatterDisplay::truncateToColumns(const String &text, int maxColumns)
 
 void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
 {
-    const uint16_t borderColor = colorWithBrightness(_matrix,
-                                                     DisplayConfiguration::NEARBY_BORDER_R,
-                                                     DisplayConfiguration::NEARBY_BORDER_G,
-                                                     DisplayConfiguration::NEARBY_BORDER_B);
-    _matrix->drawRect(0, 0, _matrixWidth, _matrixHeight, borderColor);
-
-    const int charWidth = 6;
-    const int charHeight = 8;
-    const int padding = 2;
-    const int innerWidth = _matrixWidth - 2 - (2 * padding);
-    const int innerHeight = _matrixHeight - 2 - (2 * padding);
-    const int maxCols = innerWidth / charWidth;
+    // Match tail-tracker layout: text in the left region, compass on the right,
+    // route-progress bar along the bottom (full panel width).
+    const int     charWidth  = 6;
+    const int16_t startX     = 0;
+    const int16_t compassAreaX = (int16_t)_matrixWidth - 25;
+    const int     maxCols      = (int)compassAreaX / charWidth;
 
     // Line 1: airline / operator name
     String airline = f.airline_display_name_full.length() ? f.airline_display_name_full
@@ -188,23 +183,10 @@ void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
                                                     DisplayConfiguration::NEARBY_LINE3_G,
                                                     DisplayConfiguration::NEARBY_LINE3_B);
 
-    const int lineCount = 3;
-    const int lineSpacing = 1;
-    const int totalTextHeight = lineCount * charHeight + (lineCount - 1) * lineSpacing;
-    const int topOffset = 1 + padding + (innerHeight - totalTextHeight) / 2;
-    const int16_t startX = 1 + padding;
+    // Line 1 — same vertical rhythm as tail tracker (leaves room for bottom bar).
+    drawTextLine(startX, 1, line1, line1Color);
 
-    int16_t y = topOffset;
-
-    // Line 1
-    drawTextLine(startX, y, line1, line1Color);
-    y += charHeight + lineSpacing;
-
-    // Line 2 — always show ICAO; IATA-matching chars are bright, prefix chars dim.
-    // Helper: draw one airport code, honouring the column limit.
-    // iataStart/iataEnd mark which ICAO chars overlap the IATA code (-1 = no match).
-    // Draw one airport code: ICAO with first char dim, rest bright.
-    // Falls back to all-bright IATA when ICAO is absent.
+    // Line 2
     auto drawAirport = [&](const String &icao, const String &iata, int &colsUsed)
     {
         const String &code = icao.length() ? icao : iata;
@@ -214,14 +196,13 @@ void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
         const bool useIcao = icao.length() > 0;
         for (size_t i = 0; i < code.length() && colsUsed < maxCols; ++i, ++colsUsed)
         {
-            // First char of an ICAO code is the regional prefix — render it dim.
             _matrix->setTextColor((useIcao && i == 0) ? icaoColor : iataColor);
             _matrix->write(code[i]);
         }
     };
 
     {
-        _matrix->setCursor(startX, y);
+        _matrix->setCursor(startX, 10);
         int colsUsed = 0;
 
         drawAirport(origIcao, origIata, colsUsed);
@@ -235,10 +216,36 @@ void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
 
         drawAirport(dstIcao, dstIata, colsUsed);
     }
-    y += charHeight + lineSpacing;
 
     // Line 3
-    drawTextLine(startX, y, line3, line3Color);
+    drawTextLine(startX, 19, line3, line3Color);
+
+    // --- Progress bar (same style as tail tracker) ---
+    const uint16_t barBg = _matrix->color565(DisplayConfiguration::TAIL_BAR_BG_R,
+                                              DisplayConfiguration::TAIL_BAR_BG_G,
+                                              DisplayConfiguration::TAIL_BAR_BG_B);
+    const uint16_t barFg = colorWithBrightness(_matrix,
+                                               DisplayConfiguration::TAIL_BAR_FG_R,
+                                               DisplayConfiguration::TAIL_BAR_FG_G,
+                                               DisplayConfiguration::TAIL_BAR_FG_B);
+    _matrix->fillRect(0, 30, (int16_t)_matrixWidth, 2, barBg);
+
+    int prog = f.progress_percent;
+    if (prog < 0) prog = 0;
+    if (prog > 100) prog = 100;
+    int fillW = (prog * (int)_matrixWidth) / 100;
+    if (fillW > (int)_matrixWidth) fillW = (int)_matrixWidth;
+    if (fillW > 0)
+        _matrix->fillRect(0, 30, (int16_t)fillW, 2, barFg);
+
+    // --- Compass (bearing toward aircraft from OpenSky geometry) ---
+    {
+        const double bearingDeg = isnan(f.bearing_deg) ? 0.0 : f.bearing_deg;
+        const int16_t cx     = compassAreaX + 14;
+        const int16_t cy     = (int16_t)(_matrixHeight / 2);
+        const int16_t radius = 11;
+        drawCompass(cx, cy, radius, bearingDeg);
+    }
 }
 
 void ProtomatterDisplay::displayFlights(const std::vector<FlightInfo> &flights)
@@ -397,12 +404,32 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
         return ((int)s.length() <= cols) ? s : s.substring(0, cols);
     };
 
-    // --- Bearing / distance to the tracked aircraft ---
-    // status.lat/lon are NAN when the API did not return a position.
-    const bool hasPosition = !isnan(status.lat) && !isnan(status.lon);
+    // --- Bearing / distance ---
+    // Landed: use destination (arrival airport, or Nominatim /search on arrival city
+    // when the API omits lat/lon) so the compass points to the arrival, not 0°.
+    // Otherwise use live position; (0,0) is a "no fix" placeholder from AeroAPI.
+    const bool hasPosition = !isnan(status.lat) && !isnan(status.lon)
+                             && !(status.lat == 0.0 && status.lon == 0.0);
+    bool isLanded   = status.actual_on_epoch  > 0;
+    bool isAirborne = status.actual_off_epoch > 0 && !isLanded;
+
+    const bool hasArrivalFix = isLanded
+        && !isnan(status.dest_lat) && !isnan(status.dest_lon)
+        && !(status.dest_lat == 0.0 && status.dest_lon == 0.0);
+
     double bearingDeg  = 0.0;
     float  distanceMi  = 0.0f;
-    if (hasPosition)
+    if (hasArrivalFix)
+    {
+        const double distKm = haversineKm(
+            UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+            status.dest_lat, status.dest_lon);
+        distanceMi = (float)(distKm * 0.621371);
+        bearingDeg = computeBearingDeg(
+            UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+            status.dest_lat, status.dest_lon);
+    }
+    else if (hasPosition)
     {
         const double distKm = haversineKm(
             UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
@@ -412,19 +439,13 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
             UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
             status.lat,                    status.lon);
     }
-
-    // Computed early so both line 1 and line 2 can use them.
-    bool isLanded   = status.actual_on_epoch  > 0;
-    bool isAirborne = status.actual_off_epoch > 0 && !isLanded;
-
-    // Compass bearing fallback: when no live position is available, point toward
-    // the same location shown on line 3 — origin airport when pre-departure,
-    // destination airport when landed.
-    if (!hasPosition)
+    // Last resort: airport coords from the JSON when we could not get a point yet.
+    if (!hasArrivalFix && !hasPosition)
     {
         const double fbLat = isLanded ? status.dest_lat   : status.origin_lat;
         const double fbLon = isLanded ? status.dest_lon   : status.origin_lon;
-        if (!isnan(fbLat) && !isnan(fbLon))
+        if (!isnan(fbLat) && !isnan(fbLon)
+            && !(fbLat == 0.0 && fbLon == 0.0))
             bearingDeg = computeBearingDeg(
                 UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
                 fbLat, fbLon);
@@ -520,7 +541,7 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
                 timeLine = "On Ground";
         }
 
-        if (hasPosition)
+        if (hasArrivalFix || hasPosition)
         {
             char distBuf[10];
             snprintf(distBuf, sizeof(distBuf), " %dmi", (int)roundf(distanceMi));
