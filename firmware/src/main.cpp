@@ -86,6 +86,42 @@ static unsigned long     g_lastMemLogMs     = 0;
 // ---------------------------------------------------------------------------
 static void checkButtons();
 
+// Reconnect if the STA association was lost; reset fetch intervals when the link
+// comes back (ESP32 and WiFiNINA / AirLift both use the same WiFi class API here).
+static void maintainWifiAndFetchTimers()
+{
+    const uint8_t cur = (uint8_t)WiFi.status();
+    static uint8_t  s_prev = 255;
+    if (cur == (uint8_t)WL_CONNECTED && s_prev != (uint8_t)WL_CONNECTED)
+    {
+        g_lastFetchMs     = 0;
+        g_lastTailFetchMs = 0;
+        if (s_prev != 255U) // not first loop after boot
+        {
+            Serial.print(F("WiFi: back online, IP="));
+            Serial.println(WiFi.localIP());
+        }
+    }
+    s_prev = cur;
+
+    if (SerialConfig::wifiSSID.length() == 0)
+        return;
+    if (cur == (uint8_t)WL_CONNECTED)
+        return;
+
+    static unsigned long s_lastReconnectMs = 0;
+    const unsigned long  now = millis();
+    if (s_lastReconnectMs != 0U
+        && (now - s_lastReconnectMs) < WiFiConfiguration::RECONNECT_COOLDOWN_MS)
+        return;
+    s_lastReconnectMs = now;
+
+    Serial.println(F("WiFi: disconnected; reconnecting..."));
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(SerialConfig::wifiSSID.c_str(), SerialConfig::wifiPassword.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // Display tick (called during blocking HTTP/TLS waits)
 // ---------------------------------------------------------------------------
@@ -431,13 +467,6 @@ void loop()
         }
     }
 
-    // --- MODE_SLEEP / MODE_SERIAL_CONFIG: do nothing (no fetch, no display) ---
-    if (g_appMode == MODE_SLEEP)
-    {
-        delay(10);
-        return;
-    }
-
     if (g_appMode == MODE_SERIAL_CONFIG)
     {
         // Auto-exit serial config once the user closes the menu with 'x'.
@@ -453,6 +482,17 @@ void loop()
             }
             Serial.println(F("Serial config closed — resuming normal operation."));
         }
+        delay(10);
+        return;
+    }
+
+    // Recover from long-run WiFi drops; skip while serial config is open to avoid
+    // fighting credential edits. Still runs in sleep so the link is up when awake.
+    maintainWifiAndFetchTimers();
+
+    // --- MODE_SLEEP: display off, no fetch ---
+    if (g_appMode == MODE_SLEEP)
+    {
         delay(10);
         return;
     }

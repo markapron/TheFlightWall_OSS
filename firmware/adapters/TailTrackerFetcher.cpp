@@ -7,6 +7,9 @@ Responsibilities:
 - GET Nominatim /search to resolve arrival city/dest code to dest_lat/dest_lon when
   landed and the API omits destination airport coordinates (compass on Matrix display).
 - Cache results where appropriate to limit rate to Nominatim.
+- Sticky per-tail (request ident) last lat/lon/alt when a poll omits last_position;
+  not cleared for new flight legs for the same tail; cleared when the configured
+  tail ident changes.
 */
 #include "adapters/TailTrackerFetcher.h"
 
@@ -91,6 +94,14 @@ static bool hasPlausibleAircraftPosition(double lat, double lon)
     return true;
 }
 
+// Last good aircraft fix for the current request ident (config tail). Survives
+// API responses with no last_position; intentionally not reset between flight
+// legs for the same tail. Reset in fetchStatus when `ident` changes.
+static String  s_stickyTailKey;
+static double  s_stickyLat  = NAN;
+static double  s_stickyLon  = NAN;
+static int     s_stickyAlt  = 0;
+
 // ---------------------------------------------------------------------------
 // Public
 // ---------------------------------------------------------------------------
@@ -101,6 +112,14 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     {
         Serial.println("TailTrackerFetcher: No AeroAPI key configured");
         return false;
+    }
+
+    if (ident != s_stickyTailKey)
+    {
+        s_stickyTailKey = ident;
+        s_stickyLat     = NAN;
+        s_stickyLon     = NAN;
+        s_stickyAlt     = 0;
     }
 
     const String url = String(APIConfiguration::AEROAPI_BASE_URL) + "/flights/" + ident;
@@ -242,46 +261,99 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
         }
     }
 
-    // Pass 2: no airborne leg — pick the leg whose scheduled window is closest
-    // to now, considering both scheduled_off and scheduled_on.  This shows
-    // recently-landed flights as well as upcoming departures.
+    // Pass 2: no airborne leg (Pass 1) — still need a best row when actual_off
+    // is missing from the API (common briefly after takeoff).
+    //
+    // (A) Prefer a not-yet-landed leg whose scheduled *departure* is already in
+    //     the past and after the most recent actual arrival in the list.  That
+    //     is the "current" segment (en route or API lag) without relying on
+    //     "closest schedule to now" which can wrongly favour an old *landed* row
+    //     or a *future* next-day row in edge cases.
+    // (B) Otherwise pick the leg whose scheduled window is closest to now over
+    //     *all* rows including completed.  That restores "just landed" when the
+    //     next leg is only scheduled in the future — unlike ranking *only*
+    //     incomplete rows, which always hid the most recent arrival.
     if (!foundAirborne)
     {
-        unsigned long bestDiff = ULONG_MAX;
+        unsigned long lastLandEpoch = 0;
         for (size_t i = 0; i < flights.size(); ++i)
         {
-            unsigned long minDiff = ULONG_MAX;
+            const String onStr = safeStr(flights[i], "actual_on");
+            if (onStr.length() == 0)
+                continue;
+            const unsigned long t = parseISO8601(onStr);
+            if (t > lastLandEpoch)
+                lastLandEpoch = t;
+        }
 
-            String scheduledOff = safeStr(flights[i], "scheduled_off");
-            if (scheduledOff.length() > 0)
+        int            bestAfterLand = -1;
+        unsigned long  bestDepSo     = 0;
+        for (size_t i = 0; i < flights.size(); ++i)
+        {
+            if (!flights[i]["actual_on"].isNull())
+                continue;
+
+            const String soStr = safeStr(flights[i], "scheduled_off");
+            if (soStr.length() == 0)
+                continue;
+            const unsigned long soEp = parseISO8601(soStr);
+            if (soEp == 0)
+                continue;
+            if (nowEpoch > 0 && soEp >= nowEpoch)
+                continue; // departure not in the past — next flight, not "current"
+            if (soEp <= lastLandEpoch)
+                continue; // not the segment that follows the last known landing
+            if (soEp > bestDepSo)
             {
-                unsigned long offEpoch = parseISO8601(scheduledOff);
-                if (offEpoch > 0)
-                {
-                    unsigned long d = offEpoch > nowEpoch
-                                    ? offEpoch - nowEpoch
-                                    : nowEpoch - offEpoch;
-                    if (d < minDiff) minDiff = d;
-                }
+                bestDepSo     = soEp;
+                bestAfterLand = (int)i;
             }
+        }
 
-            String scheduledOn = safeStr(flights[i], "scheduled_on");
-            if (scheduledOn.length() > 0)
+        if (bestAfterLand >= 0)
+        {
+            bestIdx = bestAfterLand;
+        }
+        else
+        {
+            unsigned long bestDiff = ULONG_MAX;
+            for (size_t i = 0; i < flights.size(); ++i)
             {
-                unsigned long onEpoch = parseISO8601(scheduledOn);
-                if (onEpoch > 0)
+                unsigned long minDiff = ULONG_MAX;
+
+                const String scheduledOff = safeStr(flights[i], "scheduled_off");
+                if (scheduledOff.length() > 0)
                 {
-                    unsigned long d = onEpoch > nowEpoch
-                                    ? onEpoch - nowEpoch
-                                    : nowEpoch - onEpoch;
-                    if (d < minDiff) minDiff = d;
+                    const unsigned long offEpoch = parseISO8601(scheduledOff);
+                    if (offEpoch > 0)
+                    {
+                        const unsigned long d = offEpoch > nowEpoch
+                                                ? offEpoch - nowEpoch
+                                                : nowEpoch - offEpoch;
+                        if (d < minDiff)
+                            minDiff = d;
+                    }
                 }
-            }
 
-            if (minDiff < bestDiff)
-            {
-                bestDiff = minDiff;
-                bestIdx  = (int)i;
+                const String scheduledOn = safeStr(flights[i], "scheduled_on");
+                if (scheduledOn.length() > 0)
+                {
+                    const unsigned long onEpoch = parseISO8601(scheduledOn);
+                    if (onEpoch > 0)
+                    {
+                        const unsigned long d = onEpoch > nowEpoch
+                                                ? onEpoch - nowEpoch
+                                                : nowEpoch - onEpoch;
+                        if (d < minDiff)
+                            minDiff = d;
+                    }
+                }
+
+                if (minDiff < bestDiff)
+                {
+                    bestDiff = minDiff;
+                    bestIdx  = (int)i;
+                }
             }
         }
     }
@@ -518,6 +590,20 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
                 Serial.println(flo, 4);
             }
         }
+    }
+
+    if (hasPlausibleAircraftPosition(result.lat, result.lon))
+    {
+        s_stickyLat = result.lat;
+        s_stickyLon = result.lon;
+        s_stickyAlt = result.altitude_ft;
+    }
+    else if (hasPlausibleAircraftPosition(s_stickyLat, s_stickyLon))
+    {
+        result.lat = s_stickyLat;
+        result.lon = s_stickyLon;
+        if (result.altitude_ft == 0 && s_stickyAlt > 0)
+            result.altitude_ft = s_stickyAlt;
     }
 
     result.valid = true;

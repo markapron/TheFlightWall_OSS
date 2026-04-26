@@ -405,9 +405,9 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
     };
 
     // --- Bearing / distance ---
-    // Landed: use destination (arrival airport, or Nominatim /search on arrival city
-    // when the API omits lat/lon) so the compass points to the arrival, not 0°.
-    // Otherwise use live position; (0,0) is a "no fix" placeholder from AeroAPI.
+    // Prefer last known aircraft position (fetcher may restore from a sticky cache
+    // when AeroAPI omits last_position for this tail). If no fix, landed →
+    // destination airport; (0,0) is a "no fix" placeholder from AeroAPI.
     const bool hasPosition = !isnan(status.lat) && !isnan(status.lon)
                              && !(status.lat == 0.0 && status.lon == 0.0);
     bool isLanded   = status.actual_on_epoch  > 0;
@@ -419,25 +419,25 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
 
     double bearingDeg  = 0.0;
     float  distanceMi  = 0.0f;
-    if (hasArrivalFix)
+    if (hasPosition)
     {
         const double distKm = haversineKm(
             UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
-            status.dest_lat, status.dest_lon);
+            status.lat,                    status.lon);
         distanceMi = (float)(distKm * 0.621371);
         bearingDeg = computeBearingDeg(
             UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
-            status.dest_lat, status.dest_lon);
+            status.lat,                    status.lon);
     }
-    else if (hasPosition)
+    else if (hasArrivalFix)
     {
         const double distKm = haversineKm(
             UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
-            status.lat,                    status.lon);
+            status.dest_lat, status.dest_lon);
         distanceMi = (float)(distKm * 0.621371);
         bearingDeg = computeBearingDeg(
             UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
-            status.lat,                    status.lon);
+            status.dest_lat, status.dest_lon);
     }
     // Last resort: airport coords from the JSON when we could not get a point yet.
     if (!hasArrivalFix && !hasPosition)
