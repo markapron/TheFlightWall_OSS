@@ -2,7 +2,8 @@
 Purpose: Render flight info on a HUB75 RGB matrix via Adafruit_Protomatter.
 Responsibilities:
 - Initialize RGB matrix based on HardwareConfiguration and user display settings.
-- Render a bordered, three-line flight “card” and a minimal loading screen.
+- Render nearby flight cards (three text lines, compass, route progress bar) and a
+  minimal loading screen; tail-tracker screen with the same compass/bar widgets.
 - Cycle through multiple flights at a configurable interval.
 */
 #include "adapters/ProtomatterDisplay.h"
@@ -13,6 +14,7 @@ Responsibilities:
 #include "config/HardwareConfiguration.h"
 #include "config/TimingConfiguration.h"
 #include "config/DisplayConfiguration.h"
+#include "utils/GeoUtils.h"
 
 static uint8_t scaleByBrightness(uint8_t c)
 {
@@ -136,18 +138,14 @@ String ProtomatterDisplay::truncateToColumns(const String &text, int maxColumns)
 
 void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
 {
-    const uint16_t borderColor = colorWithBrightness(_matrix,
-                                                     DisplayConfiguration::NEARBY_BORDER_R,
-                                                     DisplayConfiguration::NEARBY_BORDER_G,
-                                                     DisplayConfiguration::NEARBY_BORDER_B);
-    _matrix->drawRect(0, 0, _matrixWidth, _matrixHeight, borderColor);
-
-    const int charWidth = 6;
-    const int charHeight = 8;
-    const int padding = 2;
-    const int innerWidth = _matrixWidth - 2 - (2 * padding);
-    const int innerHeight = _matrixHeight - 2 - (2 * padding);
-    const int maxCols = innerWidth / charWidth;
+    // Match tail-tracker layout: text in the left region, compass on the right,
+    // route-progress bar along the bottom (full panel width).
+    const int     charWidth  = 6;
+    const int16_t startX     = 0;
+    // Reserve the same 28 px as tail-tracker so the compass ring never clips.
+    // (center x = matrixWidth-14, radius=11 → rightmost pixel = matrixWidth-3)
+    const int16_t compassAreaX = (int16_t)_matrixWidth - 28;
+    const int     maxCols      = (int)compassAreaX / charWidth;
 
     // Line 1: airline / operator name
     String airline = f.airline_display_name_full.length() ? f.airline_display_name_full
@@ -187,23 +185,10 @@ void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
                                                     DisplayConfiguration::NEARBY_LINE3_G,
                                                     DisplayConfiguration::NEARBY_LINE3_B);
 
-    const int lineCount = 3;
-    const int lineSpacing = 1;
-    const int totalTextHeight = lineCount * charHeight + (lineCount - 1) * lineSpacing;
-    const int topOffset = 1 + padding + (innerHeight - totalTextHeight) / 2;
-    const int16_t startX = 1 + padding;
+    // Line 1 — same vertical rhythm as tail tracker (leaves room for bottom bar).
+    drawTextLine(startX, 1, line1, line1Color);
 
-    int16_t y = topOffset;
-
-    // Line 1
-    drawTextLine(startX, y, line1, line1Color);
-    y += charHeight + lineSpacing;
-
-    // Line 2 — always show ICAO; IATA-matching chars are bright, prefix chars dim.
-    // Helper: draw one airport code, honouring the column limit.
-    // iataStart/iataEnd mark which ICAO chars overlap the IATA code (-1 = no match).
-    // Draw one airport code: ICAO with first char dim, rest bright.
-    // Falls back to all-bright IATA when ICAO is absent.
+    // Line 2
     auto drawAirport = [&](const String &icao, const String &iata, int &colsUsed)
     {
         const String &code = icao.length() ? icao : iata;
@@ -213,14 +198,13 @@ void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
         const bool useIcao = icao.length() > 0;
         for (size_t i = 0; i < code.length() && colsUsed < maxCols; ++i, ++colsUsed)
         {
-            // First char of an ICAO code is the regional prefix — render it dim.
             _matrix->setTextColor((useIcao && i == 0) ? icaoColor : iataColor);
             _matrix->write(code[i]);
         }
     };
 
     {
-        _matrix->setCursor(startX, y);
+        _matrix->setCursor(startX, 10);
         int colsUsed = 0;
 
         drawAirport(origIcao, origIata, colsUsed);
@@ -234,10 +218,36 @@ void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
 
         drawAirport(dstIcao, dstIata, colsUsed);
     }
-    y += charHeight + lineSpacing;
 
     // Line 3
-    drawTextLine(startX, y, line3, line3Color);
+    drawTextLine(startX, 19, line3, line3Color);
+
+    // --- Progress bar (same style as tail tracker) ---
+    const uint16_t barBg = _matrix->color565(DisplayConfiguration::TAIL_BAR_BG_R,
+                                              DisplayConfiguration::TAIL_BAR_BG_G,
+                                              DisplayConfiguration::TAIL_BAR_BG_B);
+    const uint16_t barFg = colorWithBrightness(_matrix,
+                                               DisplayConfiguration::TAIL_BAR_FG_R,
+                                               DisplayConfiguration::TAIL_BAR_FG_G,
+                                               DisplayConfiguration::TAIL_BAR_FG_B);
+    _matrix->fillRect(0, 30, (int16_t)_matrixWidth, 2, barBg);
+
+    int prog = f.progress_percent;
+    if (prog < 0) prog = 0;
+    if (prog > 100) prog = 100;
+    int fillW = (prog * (int)_matrixWidth) / 100;
+    if (fillW > (int)_matrixWidth) fillW = (int)_matrixWidth;
+    if (fillW > 0)
+        _matrix->fillRect(0, 30, (int16_t)fillW, 2, barFg);
+
+    // --- Compass (bearing toward aircraft from OpenSky geometry) ---
+    {
+        const double bearingDeg = isnan(f.bearing_deg) ? 0.0 : f.bearing_deg;
+        const int16_t cx     = compassAreaX + 14;
+        const int16_t cy     = (int16_t)(_matrixHeight / 2);
+        const int16_t radius = 11;
+        drawCompass(cx, cy, radius, bearingDeg);
+    }
 }
 
 void ProtomatterDisplay::displayFlights(const std::vector<FlightInfo> &flights)
@@ -378,62 +388,200 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
 
     _matrix->fillScreen(0);
 
-    // Use the full panel width with no left border so we get 10 char columns
-    // (64 px / 6 px per char = 10).  This gives a clean data-dense look that
-    // is visually distinct from the bordered nearby-flights card.
-    const int charWidth  = 6;
-    const int maxCols    = _matrixWidth / charWidth; // 10
-    const int16_t startX = 0;
+    const int     charWidth  = 6;
+    const int16_t startX     = 0;
+
+    // Reserve 28 px on the right for the compass widget (center x = matrixWidth-14).
+    // This leaves 100 px for text → 16 character columns at 6 px each.
+    const int16_t compassAreaX = (int16_t)_matrixWidth - 28;
+    const int     maxCols      = (int)compassAreaX / charWidth; // 16
 
     // Compute current epoch from the cached snapshot so we do not need to
     // query WiFi.getTime() on every display frame.
-    unsigned long currentEpoch = status.fetch_epoch
-                               + (millis() - status.fetch_millis) / 1000UL;
+    // If the system clock is not set, fetch_epoch can be 0 (or otherwise bogus);
+    // in that case do not attempt T-minus countdown formatting.
+    unsigned long currentEpoch = 0;
+    if (status.fetch_epoch > 0)
+        currentEpoch = status.fetch_epoch
+                     + (millis() - status.fetch_millis) / 1000UL;
 
-    // Hard-clip helper: cut at maxCols with no ellipsis so every character
-    // up to the panel edge is shown rather than sacrificing 3 chars to "...".
+    // Hard-clip helper: cut at maxCols with no ellipsis.
     auto clip = [](const String &s, int cols) -> String {
         return ((int)s.length() <= cols) ? s : s.substring(0, cols);
     };
 
-    // --- Line 1: status string (append destination code when landed) ---
-    String statusLine = status.status.length() > 0 ? status.status : String("No Data");
-    if (status.actual_on_epoch > 0 && status.dest_code.length() > 0)
-        statusLine = statusLine + String(" ") + status.dest_code;
-    statusLine = clip(statusLine, maxCols);
-
-    // --- Line 2: elapsed time or ground state ---
-    String timeLine;
+    // --- Bearing / distance ---
+    // Prefer last known aircraft position (fetcher may restore from a sticky cache
+    // when AeroAPI omits last_position for this tail). If no fix, landed →
+    // destination airport; (0,0) is a "no fix" placeholder from AeroAPI.
+    const bool hasPosition = !isnan(status.lat) && !isnan(status.lon)
+                             && !(status.lat == 0.0 && status.lon == 0.0);
     bool isLanded   = status.actual_on_epoch  > 0;
     bool isAirborne = status.actual_off_epoch > 0 && !isLanded;
 
-    if (isLanded && currentEpoch >= status.actual_on_epoch)
+    const bool hasArrivalFix = isLanded
+        && !isnan(status.dest_lat) && !isnan(status.dest_lon)
+        && !(status.dest_lat == 0.0 && status.dest_lon == 0.0);
+
+    double bearingDeg  = 0.0;
+    float  distanceMi  = 0.0f;
+    if (hasPosition)
     {
-        timeLine = formatElapsed(currentEpoch - status.actual_on_epoch, true);
+        const double distKm = haversineKm(
+            UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+            status.lat,                    status.lon);
+        distanceMi = (float)(distKm * 0.621371);
+        bearingDeg = computeBearingDeg(
+            UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+            status.lat,                    status.lon);
     }
-    else if (isAirborne && currentEpoch >= status.actual_off_epoch)
+    else if (hasArrivalFix)
     {
-        timeLine = formatElapsed(currentEpoch - status.actual_off_epoch, false);
+        const double distKm = haversineKm(
+            UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+            status.dest_lat, status.dest_lon);
+        distanceMi = (float)(distKm * 0.621371);
+        bearingDeg = computeBearingDeg(
+            UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+            status.dest_lat, status.dest_lon);
+    }
+    // Last resort: airport coords from the JSON when we could not get a point yet.
+    if (!hasArrivalFix && !hasPosition)
+    {
+        const double fbLat = isLanded ? status.dest_lat   : status.origin_lat;
+        const double fbLon = isLanded ? status.dest_lon   : status.origin_lon;
+        if (!isnan(fbLat) && !isnan(fbLon)
+            && !(fbLat == 0.0 && fbLon == 0.0))
+        {
+            const double distKm = haversineKm(
+                UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+                fbLat, fbLon);
+            distanceMi = (float)(distKm * 0.621371);
+            bearingDeg = computeBearingDeg(
+                UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+                fbLat, fbLon);
+        }
+    }
+
+    // --- Line 1: status + destination ---
+    // Use += with char literals instead of temporary String("x") objects to
+    // avoid repeated small heap allocations on every display tick.
+    String statusLine;
+    if (isAirborne && status.dest_code.length() > 0)
+    {
+        statusLine = "Flying to ";
+        statusLine += status.dest_code;
     }
     else
     {
-        timeLine = String("Preparing");
+        statusLine = status.status.length() > 0 ? status.status : "No Data";
+        if (status.dest_code.length() > 0)
+        {
+            statusLine += ' ';
+            statusLine += status.dest_code;
+        }
+    }
+    statusLine = clip(statusLine, maxCols);
+
+    // --- Line 2: compact elapsed time + altitude + distance (airborne);
+    //             elapsed time + distance (landed / on-ground fallback). ---
+    // snprintf into stack-local char buffers avoids heap allocation for the
+    // numeric parts, which is important because this function runs on every
+    // display tick() during a blocking HTTP fetch.
+    String timeLine;
+    if (isAirborne && status.altitude_ft > 0)
+    {
+        // Compact elapsed time: "1h23m", "45m", "10h" (no space between h and m).
+        if (currentEpoch >= status.actual_off_epoch)
+        {
+            const unsigned long secs  = currentEpoch - status.actual_off_epoch;
+            const unsigned long tmins = secs / 60;
+            const unsigned long th    = tmins / 60;
+            const unsigned long tm    = tmins % 60;
+            // Cap to realistic display values before snprintf so the compiler
+            // can verify the output fits the buffer (avoids -Wformat-truncation).
+            const int hh = (int)(th    < 999  ? th    : 999);
+            const int mm = (int)(tm    < 59   ? tm    : 59);
+            const int mT = (int)(tmins < 9999 ? tmins : 9999);
+            char tBuf[16];
+            if      (th == 0)  snprintf(tBuf, sizeof(tBuf), "%dm",    mT);
+            else if (th >= 10) snprintf(tBuf, sizeof(tBuf), "%dh",    hh);
+            else               snprintf(tBuf, sizeof(tBuf), "%dh%dm", hh, mm);
+            timeLine = tBuf;
+        }
+
+        // Altitude: "35.2k"
+        char altBuf[10];
+        snprintf(altBuf, sizeof(altBuf), "%.1fk", status.altitude_ft / 1000.0f);
+        if (timeLine.length() > 0) timeLine += ' ';
+        timeLine += altBuf;
+
+        // Distance: " 142mi"
+        if (hasPosition)
+        {
+            char distBuf[10];
+            snprintf(distBuf, sizeof(distBuf), " %dmi", (int)roundf(distanceMi));
+            timeLine += distBuf;
+        }
+    }
+    else
+    {
+        if (isLanded && currentEpoch >= status.actual_on_epoch)
+            timeLine = formatElapsed(currentEpoch - status.actual_on_epoch, true);
+        else if (isAirborne && currentEpoch >= status.actual_off_epoch)
+            timeLine = formatElapsed(currentEpoch - status.actual_off_epoch, false);
+        else
+        {
+            // Pre-departure: show T-minus countdown to scheduled departure
+            // when the time is known and still in the future.
+            if (currentEpoch > 0
+                    && status.scheduled_off_epoch > 0
+                    && status.actual_off_epoch == 0
+                    && status.scheduled_off_epoch > currentEpoch)
+            {
+                const unsigned long secsToGo = status.scheduled_off_epoch - currentEpoch;
+                const unsigned long minsRaw  = secsToGo / 60;
+                const int minsToGo = (int)(minsRaw  < 9999 ? minsRaw  : 9999);
+                const int hrsToGo  = (int)(minsRaw / 60 < 999 ? minsRaw / 60 : 999);
+                char tBuf[16];
+                if (hrsToGo >= 1)
+                    snprintf(tBuf, sizeof(tBuf), "T-%dh%dm", hrsToGo, minsToGo % 60);
+                else
+                    snprintf(tBuf, sizeof(tBuf), "T-%dm", minsToGo);
+                timeLine = "On Ground ";
+                timeLine += tBuf;
+            }
+            else
+                timeLine = "On Ground";
+        }
+
+        if (hasArrivalFix || hasPosition)
+        {
+            char distBuf[10];
+            snprintf(distBuf, sizeof(distBuf), " %dmi", (int)roundf(distanceMi));
+            timeLine += distBuf;
+        }
     }
     timeLine = clip(timeLine, maxCols);
 
     // --- Line 3: city / region ---
     String locLine;
     if (status.city.length() > 0 && status.region.length() > 0)
-        locLine = status.city + String(" ") + status.region;
+    {
+        locLine  = status.city;
+        locLine += ' ';
+        locLine += status.region;
+    }
     else if (status.city.length() > 0)
         locLine = status.city;
     else if (status.region.length() > 0)
         locLine = status.region;
     else
-        locLine = String("---");
+        locLine = "---";
+    locLine.replace("County", "Cnty");
     locLine = clip(locLine, maxCols);
 
-    // Text color matches user config; use amber for the time line to add contrast.
+    // --- Colors ---
     const uint16_t textColor    = colorWithBrightness(_matrix,
                                                       DisplayConfiguration::TAIL_STATUS_R,
                                                       DisplayConfiguration::TAIL_STATUS_G,
@@ -451,10 +599,13 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
                                                       DisplayConfiguration::TAIL_LOC_G,
                                                       DisplayConfiguration::TAIL_LOC_B);
 
-    drawTextLine(startX,  1, statusLine, textColor);
+    // --- Draw text lines ---
 
-    // Draw the time line character by character so the unit letters "h" and "m"
-    // are rendered dimmer than the numeric digits.
+    // Line 1: status
+    drawTextLine(startX, 1, statusLine, textColor);
+
+    // Line 2: time (and distance when available) — digits bright, letters/spaces dim.
+    // This single rendering pass works for both "1h 23m" and "1h 23m 142mi".
     _matrix->setCursor(startX, 10);
     for (size_t i = 0; i < (size_t)timeLine.length(); ++i)
     {
@@ -463,10 +614,10 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
         _matrix->write(c);
     }
 
-    drawTextLine(startX, 19, locLine,    locColor);
+    // Line 3: location
+    drawTextLine(startX, 19, locLine, locColor);
 
-    // --- Progress bar (bottom 2 rows) ---
-    // Background: very dim grey stripe across the full width.
+    // --- Progress bar (bottom 2 rows, full panel width) ---
     const uint16_t barBg = _matrix->color565(DisplayConfiguration::TAIL_BAR_BG_R,
                                               DisplayConfiguration::TAIL_BAR_BG_G,
                                               DisplayConfiguration::TAIL_BAR_BG_B);
@@ -481,7 +632,70 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
     if (fillW > 0)
         _matrix->fillRect(0, 30, (int16_t)fillW, 2, barFg);
 
+    // --- Compass widget (right side, always shown in tracking mode) ---
+    // bearingDeg is 0.0 (north) when no position is available, which serves
+    // as a neutral default while the aircraft is on the ground or untracked.
+    {
+        const int16_t cx     = compassAreaX + 14; // horizontal center of compass area
+        const int16_t cy     = (int16_t)(_matrixHeight / 2);
+        const int16_t radius = 11;
+        drawCompass(cx, cy, radius, bearingDeg);
+    }
+
     _matrix->show();
+}
+
+// Draw a north-up compass rose.  North is at the 12 o'clock position; the
+// needle points in bearingDeg (0 = N, 90 = E, 180 = S, 270 = W).
+void ProtomatterDisplay::drawCompass(int16_t cx, int16_t cy, int16_t radius, double bearingDeg)
+{
+    const uint16_t ringColor   = colorWithBrightness(_matrix,
+                                                     DisplayConfiguration::TAIL_COMPASS_RING_R,
+                                                     DisplayConfiguration::TAIL_COMPASS_RING_G,
+                                                     DisplayConfiguration::TAIL_COMPASS_RING_B);
+    const uint16_t northColor  = colorWithBrightness(_matrix,
+                                                     DisplayConfiguration::TAIL_COMPASS_NORTH_R,
+                                                     DisplayConfiguration::TAIL_COMPASS_NORTH_G,
+                                                     DisplayConfiguration::TAIL_COMPASS_NORTH_B);
+    const uint16_t needleColor = colorWithBrightness(_matrix,
+                                                     DisplayConfiguration::TAIL_COMPASS_NEEDLE_R,
+                                                     DisplayConfiguration::TAIL_COMPASS_NEEDLE_G,
+                                                     DisplayConfiguration::TAIL_COMPASS_NEEDLE_B);
+
+    // Outer ring
+    _matrix->drawCircle(cx, cy, radius, ringColor);
+
+    // Cardinal direction labels — custom bitmaps inside the compass ring.
+    // N and W use 5-wide bitmaps (bits 4..0); S and E use 3-wide (bits 2..0).
+    // Each glyph is 5 rows tall; MSB of each row byte is the left-most pixel.
+    static const uint8_t glyphN[5] = {0b10001, 0b11001, 0b10101, 0b10011, 0b10001};
+    static const uint8_t glyphS[5] = {0b111,   0b100,   0b111,   0b001,   0b111  };
+    static const uint8_t glyphE[5] = {0b111,   0b100,   0b110,   0b100,   0b111  };
+    static const uint8_t glyphW[5] = {0b10001, 0b10001, 0b10101, 0b10101, 0b01010};
+
+    // w = number of pixel columns; the top bit of each row byte is the left pixel.
+    auto drawGlyph = [&](int16_t x0, int16_t y0, const uint8_t *g, int w) {
+        const uint8_t msb = static_cast<uint8_t>(1 << (w - 1));
+        for (int r = 0; r < 5; ++r)
+            for (int c = 0; c < w; ++c)
+                if (g[r] & (msb >> c))
+                    _matrix->drawPixel(x0 + c, y0 + r, northColor);
+    };
+
+    drawGlyph(cx - 2,          cy - radius + 2, glyphN, 5); // N — top    (5-wide, centred)
+    drawGlyph(cx - 1,          cy + radius - 6, glyphS, 3); // S — bottom (3-wide)
+    drawGlyph(cx + radius - 4, cy - 2,          glyphE, 3); // E — right  (3-wide)
+    drawGlyph(cx - radius + 2, cy - 2,          glyphW, 5); // W — left   (5-wide)
+
+    // Bearing needle: line from center to a point near the ring edge.
+    const double   rad      = degreesToRadians(bearingDeg);
+    const int16_t  needleR  = radius - 2; // slightly inset from the ring
+    const int16_t  ex       = cx + (int16_t)round(sin(rad) * needleR);
+    const int16_t  ey       = cy - (int16_t)round(cos(rad) * needleR);
+    _matrix->drawLine(cx, cy, ex, ey, needleColor);
+
+    // Bright pixel at the needle tip to emphasise the direction.
+    _matrix->drawPixel(ex, ey, needleColor);
 }
 
 void ProtomatterDisplay::displayTailLoading()

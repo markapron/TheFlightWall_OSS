@@ -26,4 +26,11 @@ struct FlightInfo
     // Human-friendly display strings
     String airline_display_name_full;
     String aircraft_display_name_short;
+
+    // From OpenSky state vector (observer → aircraft). NAN when unknown.
+    double bearing_deg = NAN;
+    double distance_km = NAN;
+
+    // From AeroAPI /flights/{ident} — 0–100 along route (100 when landed if omitted).
+    int progress_percent = 0;
 };

@@ -69,6 +69,6 @@ pio run -e esp32dev --target upload
 
 - **HTTPS on Matrix Portal M4**: The AirLift co-processor handles TLS. The firmware uses `WiFiSSLClient` directly (not through `ArduinoHttpClient`) to avoid a known fragmentation issue with the AirLift's SPI transport.
 - **Chunked transfer encoding**: The OpenSky and AeroAPI responses use chunked encoding; the `wifiClientRequest()` helper in `HttpUtils` decodes this transparently.
-- **Rate limiting**: `MAX_ENRICHED_FLIGHTS` (default 3) caps the number of AeroAPI calls per cycle to stay within free-tier rate limits. State vectors are sorted by distance so the closest flights are always enriched first.
+- **Rate limiting**: `MAX_ENRICHED_FLIGHTS` (default 3) caps the number of AeroAPI calls per cycle to stay within free-tier rate limits. State vectors are sorted **airborne first** (OpenSky `on_ground == false`), then by distance, so enriched flights (and AeroAPI route progress) favor aircraft in flight.
 - **OAuth**: The OpenSky `client_credentials` token is cached and refreshed automatically 60 seconds before expiry.
 - **Display cycling during fetch**: A `wifiClientTick` callback is invoked during all blocking waits inside `wifiClientRequest()` so the display keeps cycling through flight cards even while network requests are in progress.

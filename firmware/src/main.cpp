@@ -4,7 +4,8 @@ Responsibilities:
 - Initialize serial, connect to Wi‑Fi, and construct fetchers and display.
 - Handle UP/DOWN button presses to switch between operating modes.
 - MODE_NEARBY: periodically fetch nearby state vectors and enrich with AeroAPI;
-  cycle through the resulting flight cards on the display.
+  cycle through flight cards with route progress and a bearing compass like tail
+  tracker (layout on HUB75 / Protomatter).
 - MODE_TAIL_TRACKER: periodically fetch status (progress, time, position) for a
   configured tail number and show a dedicated tracker screen with a progress bar
   and reverse-geocoded city/state.
@@ -29,6 +30,8 @@ Configuration: UserConfiguration, TailTrackerConfiguration, TimingConfiguration,
 #include "core/FlightDataFetcher.h"
 #include "models/TailFlightStatus.h"
 #include "utils/HttpUtils.h"
+#include "utils/MemoryUtils.h"
+#include "utils/RamStats.h"
 #if defined(FLIGHTWALL_DISPLAY_NEOMATRIX)
 #include "adapters/NeoMatrixDisplay.h"
 using ActiveDisplay = NeoMatrixDisplay;
@@ -55,35 +58,165 @@ enum AppMode
 // reachable via the UP-button cycle.
 static const int kCycleModeCount = 2;
 
-static AppMode g_appMode      = MODE_NEARBY;
+static AppMode g_appMode      = MODE_TAIL_TRACKER;
 static AppMode g_prevActiveMode = MODE_NEARBY; // mode to restore after sleep/config
 
 // ---------------------------------------------------------------------------
 // Global objects
 // ---------------------------------------------------------------------------
 
-static OpenSkyFetcher    g_openSky;
-static AeroAPIFetcher    g_aeroApi;
+static OpenSkyFetcher     g_openSky;
+static AeroAPIFetcher     g_aeroApi;
 static TailTrackerFetcher g_tailFetcher;
-static FlightDataFetcher *g_fetcher = nullptr;
-static ActiveDisplay     g_display;
+static FlightDataFetcher  g_flightDataFetcher(&g_openSky, &g_aeroApi);
+static ActiveDisplay      g_display;
+static AppMode            g_requestMode = MODE_COUNT;
+static uint8_t            g_consecutiveFetchFailures = 0;
 
 // MODE_NEARBY state
 static std::vector<FlightInfo> g_cachedFlights;
 static unsigned long           g_lastFetchMs = 0;
+static std::vector<FlightInfo> g_pendingFlights;
+static bool                    g_hasPendingFlights = false;
+static unsigned long           g_lastNearbyRedrawMs = 0;
 
 // MODE_TAIL_TRACKER state
 static TailFlightStatus  g_tailStatus;
-static unsigned long     g_lastTailFetchMs = 0;
+static unsigned long     g_lastTailFetchMs  = 0;
+static unsigned long     g_lastTailRedrawMs = 0;
+static unsigned long     g_lastMemLogMs     = 0;
 
 // ---------------------------------------------------------------------------
 // Button handling — forward declaration so displayTick can call it
 // ---------------------------------------------------------------------------
 static void checkButtons();
 
+static bool shouldAbortWifiRequest()
+{
+    return g_requestMode != MODE_COUNT && g_appMode != g_requestMode;
+}
+
+static void forceWifiReconnect(const __FlashStringHelper *reason)
+{
+    Serial.print(F("WiFi: forcing reconnect ("));
+    Serial.print(reason);
+    Serial.println(F(")"));
+    WiFi.disconnect();
+    delay(250);
+    WiFi.begin(SerialConfig::wifiSSID.c_str(), SerialConfig::wifiPassword.c_str());
+    g_lastFetchMs = 0;
+    g_lastTailFetchMs = 0;
+    g_consecutiveFetchFailures = 0;
+}
+
+static void noteNetworkFetchResult(bool ok)
+{
+    if (ok)
+    {
+        g_consecutiveFetchFailures = 0;
+        return;
+    }
+
+    if (WiFi.status() != WL_CONNECTED)
+        return;
+
+    ++g_consecutiveFetchFailures;
+    Serial.print(F("WiFi: fetch failed while status=CONNECTED, failures="));
+    Serial.println((int)g_consecutiveFetchFailures);
+
+    if (g_consecutiveFetchFailures >= 2)
+        forceWifiReconnect(F("stale connected link"));
+}
+
+// Reconnect if the STA association was lost; reset fetch intervals when the link
+// comes back (ESP32 and WiFiNINA / AirLift both use the same WiFi class API here).
+static void maintainWifiAndFetchTimers()
+{
+    const uint8_t cur = (uint8_t)WiFi.status();
+    static uint8_t  s_prev = 255;
+    if (cur == (uint8_t)WL_CONNECTED && s_prev != (uint8_t)WL_CONNECTED)
+    {
+        g_lastFetchMs     = 0;
+        g_lastTailFetchMs = 0;
+        g_consecutiveFetchFailures = 0;
+        if (s_prev != 255U) // not first loop after boot
+        {
+            Serial.print(F("WiFi: back online, IP="));
+            Serial.println(WiFi.localIP());
+        }
+    }
+    s_prev = cur;
+
+    if (SerialConfig::wifiSSID.length() == 0)
+        return;
+    if (cur == (uint8_t)WL_CONNECTED)
+        return;
+
+    static unsigned long s_lastReconnectMs = 0;
+    const unsigned long  now = millis();
+    if (s_lastReconnectMs != 0U
+        && (now - s_lastReconnectMs) < WiFiConfiguration::RECONNECT_COOLDOWN_MS)
+        return;
+    s_lastReconnectMs = now;
+
+    Serial.println(F("WiFi: disconnected; reconnecting..."));
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(SerialConfig::wifiSSID.c_str(), SerialConfig::wifiPassword.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // Display tick (called during blocking HTTP/TLS waits)
 // ---------------------------------------------------------------------------
+
+// Full tail-matrix redraw: rate-limited to reduce heap churn (see
+// TailTrackerConfiguration::DISPLAY_REDRAW_MIN_MS). Use force after a new fetch
+// or when changing modes.
+static void tailTrackerRedrawIfDue(bool force)
+{
+    if (g_appMode != MODE_TAIL_TRACKER)
+        return;
+
+    const unsigned long now = millis();
+    if (!force && g_lastTailRedrawMs != 0 &&
+        (now - g_lastTailRedrawMs) < TailTrackerConfiguration::DISPLAY_REDRAW_MIN_MS)
+    {
+        return;
+    }
+    g_lastTailRedrawMs = now;
+
+    if (g_tailStatus.valid)
+        g_display.displayTailTracker(g_tailStatus);
+    else
+        g_display.displayTailLoading();
+}
+
+// Nearby redraw is synchronised to the user-configured cycle time so a long fetch
+// can't cause a card to flash briefly when new data arrives.
+static void nearbyRedrawIfDue(bool force)
+{
+    if (g_appMode != MODE_NEARBY)
+        return;
+
+    const unsigned long now = millis();
+    const unsigned long intervalMs = TimingConfiguration::DISPLAY_CYCLE_SECONDS * 1000UL;
+    if (!force && g_lastNearbyRedrawMs != 0 &&
+        (now - g_lastNearbyRedrawMs) < intervalMs)
+    {
+        return;
+    }
+
+    // Apply fresh data only at redraw boundaries.
+    if (g_hasPendingFlights)
+    {
+        g_cachedFlights = g_pendingFlights;
+        flightwallVectorDrop(g_pendingFlights);
+        g_hasPendingFlights = false;
+    }
+
+    g_lastNearbyRedrawMs = now;
+    g_display.displayFlights(g_cachedFlights);
+}
 
 static void displayTick()
 {
@@ -96,15 +229,10 @@ static void displayTick()
         return;
 
     if (g_appMode == MODE_TAIL_TRACKER)
-    {
-        if (g_tailStatus.valid)
-            g_display.displayTailTracker(g_tailStatus);
-        else
-            g_display.displayTailLoading();
-    }
+        tailTrackerRedrawIfDue(false);
     else
     {
-        g_display.displayFlights(g_cachedFlights);
+        nearbyRedrawIfDue(false);
     }
 }
 
@@ -148,6 +276,11 @@ static void checkButtons()
             g_appMode = g_prevActiveMode;
             g_lastFetchMs     = 0;
             g_lastTailFetchMs = 0;
+            if (g_appMode == MODE_TAIL_TRACKER)
+            {
+                g_lastTailRedrawMs = 0;
+                g_lastMemLogMs     = 0;
+            }
             Serial.print(F("UP: restored mode → "));
             Serial.println(g_appMode == MODE_TAIL_TRACKER ? "TAIL_TRACKER" : "NEARBY");
         }
@@ -163,6 +296,8 @@ static void checkButtons()
                 if (g_appMode == MODE_TAIL_TRACKER)
                 {
                     if (!g_tailStatus.valid) g_lastTailFetchMs = 0;
+                    g_lastTailRedrawMs = 0;
+                    g_lastMemLogMs     = 0;
                 }
                 else
                 {
@@ -190,6 +325,11 @@ static void checkButtons()
             g_appMode        = g_prevActiveMode;
             g_lastFetchMs     = 0;
             g_lastTailFetchMs = 0;
+            if (g_appMode == MODE_TAIL_TRACKER)
+            {
+                g_lastTailRedrawMs = 0;
+                g_lastMemLogMs     = 0;
+            }
             Serial.println(F("DOWN: waking up."));
         }
         else if (g_appMode != MODE_SERIAL_CONFIG)
@@ -317,6 +457,7 @@ void setup()
     g_display.initialize();
     g_display.displayMessage(String("FlightWall"));
     wifiClientTick = displayTick;
+    wifiClientShouldAbort = shouldAbortWifiRequest;
 
     if (SerialConfig::wifiSSID.length() > 0)
     {
@@ -370,7 +511,6 @@ void setup()
         }
     }
 
-    g_fetcher = new FlightDataFetcher(&g_openSky, &g_aeroApi);
 }
 
 // ---------------------------------------------------------------------------
@@ -384,11 +524,18 @@ void loop()
     SerialConfig::tick();
     checkButtons();
 
-    // --- MODE_SLEEP / MODE_SERIAL_CONFIG: do nothing (no fetch, no display) ---
-    if (g_appMode == MODE_SLEEP)
+    // Drop the other mode’s heavy String-backed cache when switching views so
+    // nearby + tail never hold two full datasets at once.
     {
-        delay(10);
-        return;
+        static AppMode s_lastMode = static_cast<AppMode>(255);
+        if (g_appMode != s_lastMode)
+        {
+            if (g_appMode == MODE_TAIL_TRACKER)
+                flightwallVectorDrop(g_cachedFlights);
+            else if (g_appMode == MODE_NEARBY)
+                g_tailStatus = TailFlightStatus();
+            s_lastMode = g_appMode;
+        }
     }
 
     if (g_appMode == MODE_SERIAL_CONFIG)
@@ -399,8 +546,24 @@ void loop()
             g_appMode = g_prevActiveMode;
             g_lastFetchMs     = 0;
             g_lastTailFetchMs = 0;
+            if (g_appMode == MODE_TAIL_TRACKER)
+            {
+                g_lastTailRedrawMs = 0;
+                g_lastMemLogMs     = 0;
+            }
             Serial.println(F("Serial config closed — resuming normal operation."));
         }
+        delay(10);
+        return;
+    }
+
+    // Recover from long-run WiFi drops; skip while serial config is open to avoid
+    // fighting credential edits. Still runs in sleep so the link is up when awake.
+    maintainWifiAndFetchTimers();
+
+    // --- MODE_SLEEP: display off, no fetch ---
+    if (g_appMode == MODE_SLEEP)
+    {
         delay(10);
         return;
     }
@@ -414,7 +577,15 @@ void loop()
         {
             std::vector<StateVector> states;
             std::vector<FlightInfo>  flights;
-            size_t enriched = g_fetcher->fetchFlights(states, flights);
+            g_requestMode = MODE_NEARBY;
+            size_t enriched = g_flightDataFetcher.fetchFlights(states, flights);
+            g_requestMode = MODE_COUNT;
+            if (g_appMode != MODE_NEARBY)
+            {
+                flightwallVectorDrop(flights);
+                delay(10);
+                return;
+            }
 
             Serial.print("OpenSky state vectors: ");
             Serial.println((int)states.size());
@@ -450,12 +621,15 @@ void loop()
 
             g_cachedFlights = flights;
             g_lastFetchMs   = millis();
+            // Stage new flights; apply on the next scheduled redraw boundary.
+            g_pendingFlights = flights;
+            g_hasPendingFlights = true;
         }
 
         // Re-check mode: it may have changed to SLEEP/CONFIG during the
         // blocking fetch above (via displayTick → checkButtons).
         if (g_appMode == MODE_NEARBY)
-            g_display.displayFlights(g_cachedFlights);
+            nearbyRedrawIfDue(g_lastNearbyRedrawMs == 0);
     }
 
     // --- MODE_TAIL_TRACKER: fetch status for the configured tail number ---
@@ -471,15 +645,28 @@ void loop()
             Serial.println(SerialConfig::tailNumber);
 
             TailFlightStatus newStatus;
-            if (g_tailFetcher.fetchStatus(
-                    SerialConfig::tailNumber.c_str(), newStatus))
+            g_requestMode = MODE_TAIL_TRACKER;
+            const bool fetchOk = g_tailFetcher.fetchStatus(
+                    SerialConfig::tailNumber.c_str(), newStatus);
+            g_requestMode = MODE_COUNT;
+            if (g_appMode != MODE_TAIL_TRACKER)
+            {
+                delay(10);
+                return;
+            }
+            noteNetworkFetchResult(fetchOk);
+
+            if (fetchOk)
             {
                 g_tailStatus = newStatus;
+                tailTrackerRedrawIfDue(true);
                 Serial.print("TailTracker: status=");
                 Serial.print(g_tailStatus.status);
                 Serial.print(" progress=");
                 Serial.print(g_tailStatus.progress_percent);
-                Serial.print("% city=");
+                Serial.print("% alt=");
+                Serial.print(g_tailStatus.altitude_ft);
+                Serial.print("ft city=");
                 Serial.print(g_tailStatus.city);
                 Serial.print(" ");
                 Serial.println(g_tailStatus.region);
@@ -495,10 +682,33 @@ void loop()
         // Re-check mode for the same reason as above.
         if (g_appMode == MODE_TAIL_TRACKER)
         {
-            if (g_tailStatus.valid)
-                g_display.displayTailTracker(g_tailStatus);
-            else
-                g_display.displayTailLoading();
+            tailTrackerRedrawIfDue(false);
+
+            if (TailTrackerConfiguration::MEM_LOG_INTERVAL_MS > 0 &&
+                (g_lastMemLogMs == 0 ||
+                 now - g_lastMemLogMs >= TailTrackerConfiguration::MEM_LOG_INTERVAL_MS))
+            {
+                g_lastMemLogMs     = now;
+                const size_t stackGap = flightwallApproxFreeBytes();
+                const size_t heapAux  = flightwallLargestFreeBlockBytes();
+#if defined(ARDUINO_ARCH_SAMD)
+                Serial.print(F("[tail] stack_heap_gap="));
+#else
+                Serial.print(F("[tail] approx free bytes="));
+#endif
+                Serial.print((unsigned long)stackGap);
+#if defined(ARDUINO_ARCH_ESP32)
+                Serial.print(F(" largest_block="));
+#elif defined(ARDUINO_ARCH_SAMD)
+                // newlib mallinfo().fordblks on the SAMD51; not the WiFi ESP.
+                Serial.print(F(" malloc_free="));
+#else
+                Serial.print(F(" heap_aux="));
+#endif
+                Serial.print((unsigned long)heapAux);
+                Serial.print(F(" redraw_min_ms="));
+                Serial.println((unsigned long)TailTrackerConfiguration::DISPLAY_REDRAW_MIN_MS);
+            }
         }
     }
 

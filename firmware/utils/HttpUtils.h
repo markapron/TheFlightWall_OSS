@@ -12,6 +12,12 @@ bool parseUrl(const String &url, bool &outHttps, String &outHost, uint16_t &outP
 typedef void (*WifiClientTickFn)();
 extern WifiClientTickFn wifiClientTick;
 
+// Optional abort callback checked while waiting for network data. This lets the
+// app cancel an in-flight request when the user changes modes during a blocking
+// AirLift/TLS operation.
+typedef bool (*WifiClientAbortFn)();
+extern WifiClientAbortFn wifiClientShouldAbort;
+
 // Direct WiFiSSLClient (or plain WiFiClient when FLIGHTWALL_SKIP_TLS is defined) HTTP request
 // for SAMD/AirLift boards. Bypasses ArduinoHttpClient, which is incompatible with WiFiSSLClient
 // on the AirLift SPI transport (small fragmented writes never flush as a complete request).
@@ -26,5 +32,14 @@ extern WifiClientTickFn wifiClientTick;
 bool wifiClientRequest(const String &method, const String &host, uint16_t port,
                        const String &path, const String &extraHeaders,
                        const String &body, int &outCode, String &outPayload);
+
+// Streaming variant for large response bodies. The callback is invoked with body
+// bytes after transfer-encoding decoding (if chunked). Return false from the
+// callback to stop reading early.
+typedef bool (*WifiClientBodyChunkFn)(const char *data, size_t len, void *ctx);
+bool wifiClientRequestStream(const String &method, const String &host, uint16_t port,
+                             const String &path, const String &extraHeaders,
+                             const String &body, int &outCode,
+                             WifiClientBodyChunkFn onChunk, void *ctx);
 #endif
 
