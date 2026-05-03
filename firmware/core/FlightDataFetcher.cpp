@@ -11,6 +11,7 @@ Output: Returns count of enriched flights and fills outStates/outFlights.
 #include "core/FlightDataFetcher.h"
 #include "config/UserConfiguration.h"
 #include "adapters/FlightWallFetcher.h"
+#include "utils/GeoUtils.h"
 #include "utils/MemoryUtils.h"
 #include <algorithm>
 
@@ -25,6 +26,15 @@ static bool compareStateForEnrichment(const StateVector &a, const StateVector &b
 FlightDataFetcher::FlightDataFetcher(BaseStateVectorFetcher *stateFetcher,
                                      BaseFlightFetcher *flightFetcher)
     : _stateFetcher(stateFetcher), _flightFetcher(flightFetcher) {}
+
+static bool hasPlausibleLatLon(double lat, double lon)
+{
+    if (isnan(lat) || isnan(lon))
+        return false;
+    if (lat == 0.0 && lon == 0.0)
+        return false;
+    return true;
+}
 
 size_t FlightDataFetcher::fetchFlights(std::vector<StateVector> &outStates,
                                        std::vector<FlightInfo> &outFlights)
@@ -60,6 +70,28 @@ size_t FlightDataFetcher::fetchFlights(std::vector<StateVector> &outStates,
         FlightInfo info;
         if (!_flightFetcher->fetchFlightInfo(s.callsign, info))
             continue;
+
+        // Nearby progress fallback: AeroAPI intermittently omits progress_percent.
+        // If we have origin/dest airport coordinates (from AeroAPI) and a current
+        // aircraft fix (from OpenSky), compute a best-effort route completion.
+        if (info.progress_percent <= 0
+            && hasPlausibleLatLon(s.lat, s.lon)
+            && hasPlausibleLatLon(info.origin.latitude, info.origin.longitude)
+            && hasPlausibleLatLon(info.destination.latitude, info.destination.longitude))
+        {
+            const double totalKm = haversineKm(info.origin.latitude, info.origin.longitude,
+                                               info.destination.latitude, info.destination.longitude);
+            // Ignore degenerate routes / missing coords.
+            if (totalKm > 10.0)
+            {
+                const double traveledKm = haversineKm(info.origin.latitude, info.origin.longitude,
+                                                     s.lat, s.lon);
+                int prog = (int)lround((traveledKm * 100.0) / totalKm);
+                if (prog < 0)   prog = 0;
+                if (prog > 100) prog = 100;
+                info.progress_percent = prog;
+            }
+        }
 
         if (info.operator_icao.length())
         {

@@ -142,7 +142,9 @@ void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
     // route-progress bar along the bottom (full panel width).
     const int     charWidth  = 6;
     const int16_t startX     = 0;
-    const int16_t compassAreaX = (int16_t)_matrixWidth - 25;
+    // Reserve the same 28 px as tail-tracker so the compass ring never clips.
+    // (center x = matrixWidth-14, radius=11 → rightmost pixel = matrixWidth-3)
+    const int16_t compassAreaX = (int16_t)_matrixWidth - 28;
     const int     maxCols      = (int)compassAreaX / charWidth;
 
     // Line 1: airline / operator name
@@ -396,8 +398,12 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
 
     // Compute current epoch from the cached snapshot so we do not need to
     // query WiFi.getTime() on every display frame.
-    unsigned long currentEpoch = status.fetch_epoch
-                               + (millis() - status.fetch_millis) / 1000UL;
+    // If the system clock is not set, fetch_epoch can be 0 (or otherwise bogus);
+    // in that case do not attempt T-minus countdown formatting.
+    unsigned long currentEpoch = 0;
+    if (status.fetch_epoch > 0)
+        currentEpoch = status.fetch_epoch
+                     + (millis() - status.fetch_millis) / 1000UL;
 
     // Hard-clip helper: cut at maxCols with no ellipsis.
     auto clip = [](const String &s, int cols) -> String {
@@ -446,9 +452,15 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
         const double fbLon = isLanded ? status.dest_lon   : status.origin_lon;
         if (!isnan(fbLat) && !isnan(fbLon)
             && !(fbLat == 0.0 && fbLon == 0.0))
+        {
+            const double distKm = haversineKm(
+                UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+                fbLat, fbLon);
+            distanceMi = (float)(distKm * 0.621371);
             bearingDeg = computeBearingDeg(
                 UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
                 fbLat, fbLon);
+        }
     }
 
     // --- Line 1: status + destination ---
@@ -522,7 +534,8 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
         {
             // Pre-departure: show T-minus countdown to scheduled departure
             // when the time is known and still in the future.
-            if (status.scheduled_off_epoch > 0
+            if (currentEpoch > 0
+                    && status.scheduled_off_epoch > 0
                     && status.actual_off_epoch == 0
                     && status.scheduled_off_epoch > currentEpoch)
             {
@@ -535,7 +548,8 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
                     snprintf(tBuf, sizeof(tBuf), "T-%dh%dm", hrsToGo, minsToGo % 60);
                 else
                     snprintf(tBuf, sizeof(tBuf), "T-%dm", minsToGo);
-                timeLine = String("On Ground ") + tBuf;
+                timeLine = "On Ground ";
+                timeLine += tBuf;
             }
             else
                 timeLine = "On Ground";

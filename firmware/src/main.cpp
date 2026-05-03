@@ -70,10 +70,15 @@ static AeroAPIFetcher     g_aeroApi;
 static TailTrackerFetcher g_tailFetcher;
 static FlightDataFetcher  g_flightDataFetcher(&g_openSky, &g_aeroApi);
 static ActiveDisplay      g_display;
+static AppMode            g_requestMode = MODE_COUNT;
+static uint8_t            g_consecutiveFetchFailures = 0;
 
 // MODE_NEARBY state
 static std::vector<FlightInfo> g_cachedFlights;
 static unsigned long           g_lastFetchMs = 0;
+static std::vector<FlightInfo> g_pendingFlights;
+static bool                    g_hasPendingFlights = false;
+static unsigned long           g_lastNearbyRedrawMs = 0;
 
 // MODE_TAIL_TRACKER state
 static TailFlightStatus  g_tailStatus;
@@ -86,6 +91,43 @@ static unsigned long     g_lastMemLogMs     = 0;
 // ---------------------------------------------------------------------------
 static void checkButtons();
 
+static bool shouldAbortWifiRequest()
+{
+    return g_requestMode != MODE_COUNT && g_appMode != g_requestMode;
+}
+
+static void forceWifiReconnect(const __FlashStringHelper *reason)
+{
+    Serial.print(F("WiFi: forcing reconnect ("));
+    Serial.print(reason);
+    Serial.println(F(")"));
+    WiFi.disconnect();
+    delay(250);
+    WiFi.begin(SerialConfig::wifiSSID.c_str(), SerialConfig::wifiPassword.c_str());
+    g_lastFetchMs = 0;
+    g_lastTailFetchMs = 0;
+    g_consecutiveFetchFailures = 0;
+}
+
+static void noteNetworkFetchResult(bool ok)
+{
+    if (ok)
+    {
+        g_consecutiveFetchFailures = 0;
+        return;
+    }
+
+    if (WiFi.status() != WL_CONNECTED)
+        return;
+
+    ++g_consecutiveFetchFailures;
+    Serial.print(F("WiFi: fetch failed while status=CONNECTED, failures="));
+    Serial.println((int)g_consecutiveFetchFailures);
+
+    if (g_consecutiveFetchFailures >= 2)
+        forceWifiReconnect(F("stale connected link"));
+}
+
 // Reconnect if the STA association was lost; reset fetch intervals when the link
 // comes back (ESP32 and WiFiNINA / AirLift both use the same WiFi class API here).
 static void maintainWifiAndFetchTimers()
@@ -96,6 +138,7 @@ static void maintainWifiAndFetchTimers()
     {
         g_lastFetchMs     = 0;
         g_lastTailFetchMs = 0;
+        g_consecutiveFetchFailures = 0;
         if (s_prev != 255U) // not first loop after boot
         {
             Serial.print(F("WiFi: back online, IP="));
@@ -148,6 +191,33 @@ static void tailTrackerRedrawIfDue(bool force)
         g_display.displayTailLoading();
 }
 
+// Nearby redraw is synchronised to the user-configured cycle time so a long fetch
+// can't cause a card to flash briefly when new data arrives.
+static void nearbyRedrawIfDue(bool force)
+{
+    if (g_appMode != MODE_NEARBY)
+        return;
+
+    const unsigned long now = millis();
+    const unsigned long intervalMs = TimingConfiguration::DISPLAY_CYCLE_SECONDS * 1000UL;
+    if (!force && g_lastNearbyRedrawMs != 0 &&
+        (now - g_lastNearbyRedrawMs) < intervalMs)
+    {
+        return;
+    }
+
+    // Apply fresh data only at redraw boundaries.
+    if (g_hasPendingFlights)
+    {
+        g_cachedFlights = g_pendingFlights;
+        flightwallVectorDrop(g_pendingFlights);
+        g_hasPendingFlights = false;
+    }
+
+    g_lastNearbyRedrawMs = now;
+    g_display.displayFlights(g_cachedFlights);
+}
+
 static void displayTick()
 {
     // Process button presses mid-fetch so a mode switch is never blocked by
@@ -162,7 +232,7 @@ static void displayTick()
         tailTrackerRedrawIfDue(false);
     else
     {
-        g_display.displayFlights(g_cachedFlights);
+        nearbyRedrawIfDue(false);
     }
 }
 
@@ -387,6 +457,7 @@ void setup()
     g_display.initialize();
     g_display.displayMessage(String("FlightWall"));
     wifiClientTick = displayTick;
+    wifiClientShouldAbort = shouldAbortWifiRequest;
 
     if (SerialConfig::wifiSSID.length() > 0)
     {
@@ -506,7 +577,15 @@ void loop()
         {
             std::vector<StateVector> states;
             std::vector<FlightInfo>  flights;
+            g_requestMode = MODE_NEARBY;
             size_t enriched = g_flightDataFetcher.fetchFlights(states, flights);
+            g_requestMode = MODE_COUNT;
+            if (g_appMode != MODE_NEARBY)
+            {
+                flightwallVectorDrop(flights);
+                delay(10);
+                return;
+            }
 
             Serial.print("OpenSky state vectors: ");
             Serial.println((int)states.size());
@@ -542,12 +621,15 @@ void loop()
 
             g_cachedFlights = flights;
             g_lastFetchMs   = millis();
+            // Stage new flights; apply on the next scheduled redraw boundary.
+            g_pendingFlights = flights;
+            g_hasPendingFlights = true;
         }
 
         // Re-check mode: it may have changed to SLEEP/CONFIG during the
         // blocking fetch above (via displayTick → checkButtons).
         if (g_appMode == MODE_NEARBY)
-            g_display.displayFlights(g_cachedFlights);
+            nearbyRedrawIfDue(g_lastNearbyRedrawMs == 0);
     }
 
     // --- MODE_TAIL_TRACKER: fetch status for the configured tail number ---
@@ -563,8 +645,18 @@ void loop()
             Serial.println(SerialConfig::tailNumber);
 
             TailFlightStatus newStatus;
-            if (g_tailFetcher.fetchStatus(
-                    SerialConfig::tailNumber.c_str(), newStatus))
+            g_requestMode = MODE_TAIL_TRACKER;
+            const bool fetchOk = g_tailFetcher.fetchStatus(
+                    SerialConfig::tailNumber.c_str(), newStatus);
+            g_requestMode = MODE_COUNT;
+            if (g_appMode != MODE_TAIL_TRACKER)
+            {
+                delay(10);
+                return;
+            }
+            noteNetworkFetchResult(fetchOk);
+
+            if (fetchOk)
             {
                 g_tailStatus = newStatus;
                 tailTrackerRedrawIfDue(true);
@@ -597,9 +689,23 @@ void loop()
                  now - g_lastMemLogMs >= TailTrackerConfiguration::MEM_LOG_INTERVAL_MS))
             {
                 g_lastMemLogMs     = now;
-                const size_t bytes = flightwallApproxFreeBytes();
+                const size_t stackGap = flightwallApproxFreeBytes();
+                const size_t heapAux  = flightwallLargestFreeBlockBytes();
+#if defined(ARDUINO_ARCH_SAMD)
+                Serial.print(F("[tail] stack_heap_gap="));
+#else
                 Serial.print(F("[tail] approx free bytes="));
-                Serial.print((unsigned long)bytes);
+#endif
+                Serial.print((unsigned long)stackGap);
+#if defined(ARDUINO_ARCH_ESP32)
+                Serial.print(F(" largest_block="));
+#elif defined(ARDUINO_ARCH_SAMD)
+                // newlib mallinfo().fordblks on the SAMD51; not the WiFi ESP.
+                Serial.print(F(" malloc_free="));
+#else
+                Serial.print(F(" heap_aux="));
+#endif
+                Serial.print((unsigned long)heapAux);
                 Serial.print(F(" redraw_min_ms="));
                 Serial.println((unsigned long)TailTrackerConfiguration::DISPLAY_REDRAW_MIN_MS);
             }

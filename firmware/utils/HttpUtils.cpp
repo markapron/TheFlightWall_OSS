@@ -2,11 +2,17 @@
 #include "utils/MemoryUtils.h"
 
 WifiClientTickFn wifiClientTick = nullptr;
+WifiClientAbortFn wifiClientShouldAbort = nullptr;
 
 static inline void tick()
 {
     if (wifiClientTick)
         wifiClientTick();
+}
+
+static inline bool shouldAbort()
+{
+    return wifiClientShouldAbort && wifiClientShouldAbort();
 }
 
 #if !defined(ARDUINO_ARCH_ESP32)
@@ -74,10 +80,16 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
     Serial.println("wifiClientRequest: request sent, waiting for response...");
 
     // Wait up to 30 s for the server to start responding
-    unsigned long timeout = millis() + 30000UL;
+    const unsigned long startWaitMs = millis();
     while (!client.available())
     {
-        if (millis() > timeout)
+        if (shouldAbort())
+        {
+            Serial.println("wifiClientRequest: aborted");
+            client.stop();
+            return false;
+        }
+        if (millis() - startWaitMs >= 30000UL)
         {
             Serial.println("wifiClientRequest: timeout waiting for first byte");
             client.stop();
@@ -108,6 +120,12 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
     bool  isChunked = false;
     while (client.connected() || client.available())
     {
+        if (shouldAbort())
+        {
+            Serial.println("wifiClientRequest: aborted");
+            client.stop();
+            return false;
+        }
         tick();
         headerLine = client.readStringUntil('\n');
         headerLine.trim();
@@ -135,6 +153,12 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
         String sizeLine;
         while (client.connected() || client.available())
         {
+            if (shouldAbort())
+            {
+                Serial.println("wifiClientRequest: aborted");
+                client.stop();
+                return false;
+            }
             if (outPayload.length() >= maxBodyBytes)
                 break; // body limit reached — close early
 
@@ -162,11 +186,17 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
             }
 
             unsigned long read = 0;
-            unsigned long chunkTimeout = millis() + 10000UL;
+            unsigned long lastChunkProgressMs = millis();
             // +1 so we can null-terminate for String::operator+= (JSON is ASCII, no embedded nulls)
             char buf[65];
             while (read < chunkSize)
             {
+                if (shouldAbort())
+                {
+                    Serial.println("wifiClientRequest: aborted");
+                    client.stop();
+                    return false;
+                }
                 if (outPayload.length() >= maxBodyBytes)
                     break; // body limit reached mid-chunk
                 if (client.available())
@@ -181,10 +211,10 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
                         buf[n] = '\0';
                         outPayload += buf;
                         read += (unsigned long)n;
-                        chunkTimeout = millis() + 5000UL;
+                        lastChunkProgressMs = millis();
                     }
                 }
-                else if (millis() > chunkTimeout)
+                else if (millis() - lastChunkProgressMs >= 10000UL)
                 {
                     Serial.println("wifiClientRequest: timeout reading chunk data");
                     break;
@@ -202,11 +232,17 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
     else
     {
         // Non-chunked: read raw body until connection closes or limit reached
-        unsigned long bodyTimeout = millis() + 15000UL;
+        unsigned long lastBodyProgressMs = millis();
         // +1 so we can null-terminate for String::operator+= (JSON is ASCII, no embedded nulls)
         char buf[65];
         while (client.connected() || client.available())
         {
+            if (shouldAbort())
+            {
+                Serial.println("wifiClientRequest: aborted");
+                client.stop();
+                return false;
+            }
             if (client.available() && outPayload.length() < maxBodyBytes)
             {
                 size_t canRead = sizeof(buf) - 1;
@@ -217,10 +253,11 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
                 {
                     buf[n] = '\0';
                     outPayload += buf;
-                    bodyTimeout = millis() + 5000UL;
+                    lastBodyProgressMs = millis();
                 }
             }
-            if (outPayload.length() >= maxBodyBytes || millis() > bodyTimeout)
+            if (outPayload.length() >= maxBodyBytes ||
+                millis() - lastBodyProgressMs >= 15000UL)
                 break;
             tick();
             delay(10);
@@ -238,6 +275,213 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
     if (outCode < 200 || outCode >= 300)
         flightwallStringDrop(outPayload);
 
+    return true;
+}
+
+bool wifiClientRequestStream(const String &method, const String &host, uint16_t port,
+                             const String &path, const String &extraHeaders,
+                             const String &body, int &outCode,
+                             WifiClientBodyChunkFn onChunk, void *ctx)
+{
+    outCode = -1;
+
+#if defined(FLIGHTWALL_SKIP_TLS)
+    WiFiClient client;
+#else
+    WiFiSSLClient client;
+#endif
+
+    Serial.print("wifiClientRequestStream: ");
+    Serial.print(method);
+    Serial.print(" ");
+    Serial.print(host);
+    Serial.print(":");
+    Serial.print(port);
+    Serial.println(path);
+
+    tick();
+    if (!client.connect(host.c_str(), port))
+    {
+        Serial.println("wifiClientRequestStream: connect() failed");
+        return false;
+    }
+    tick();
+    Serial.println("wifiClientRequestStream: connected, sending request...");
+
+    client.print(method);
+    client.print(" ");
+    client.print(path);
+    client.println(" HTTP/1.1");
+    client.print("Host: ");
+    client.println(host);
+    client.println("Connection: close");
+    if (body.length() > 0)
+    {
+        client.print("Content-Length: ");
+        client.println((int)body.length());
+    }
+    if (extraHeaders.length() > 0)
+        client.print(extraHeaders);
+    client.println();
+    if (body.length() > 0)
+        client.print(body);
+    client.flush();
+
+    Serial.println("wifiClientRequestStream: request sent, waiting for response...");
+
+    const unsigned long startWaitMs = millis();
+    while (!client.available())
+    {
+        if (shouldAbort())
+        {
+            Serial.println("wifiClientRequestStream: aborted");
+            client.stop();
+            return false;
+        }
+        if (millis() - startWaitMs >= 30000UL)
+        {
+            Serial.println("wifiClientRequestStream: timeout waiting for first byte");
+            client.stop();
+            return false;
+        }
+        tick();
+        delay(50);
+    }
+
+    client.setTimeout(10000);
+    String statusLine = client.readStringUntil('\n');
+    statusLine.trim();
+    Serial.print("wifiClientRequestStream: status line: ");
+    Serial.println(statusLine);
+    int sp = statusLine.indexOf(' ');
+    if (sp >= 0)
+        outCode = statusLine.substring(sp + 1, sp + 4).toInt();
+    flightwallStringDrop(statusLine);
+
+    String headerLine;
+    bool isChunked = false;
+    while (client.connected() || client.available())
+    {
+        if (shouldAbort())
+        {
+            Serial.println("wifiClientRequestStream: aborted");
+            client.stop();
+            return false;
+        }
+        tick();
+        headerLine = client.readStringUntil('\n');
+        headerLine.trim();
+        if (headerLine.length() == 0)
+            break;
+        headerLine.toLowerCase();
+        if (headerLine.indexOf("transfer-encoding") >= 0 && headerLine.indexOf("chunked") >= 0)
+        {
+            isChunked = true;
+            Serial.println("wifiClientRequestStream: chunked transfer encoding detected");
+        }
+    }
+    flightwallStringDrop(headerLine);
+
+    size_t totalBytes = 0;
+    bool keepGoing = true;
+    char buf[65];
+
+    if (isChunked)
+    {
+        String sizeLine;
+        while (keepGoing && (client.connected() || client.available()))
+        {
+            if (shouldAbort())
+            {
+                Serial.println("wifiClientRequestStream: aborted");
+                client.stop();
+                return false;
+            }
+            sizeLine = client.readStringUntil('\n');
+            sizeLine.trim();
+            if (sizeLine.length() == 0)
+                continue;
+
+            int semi = sizeLine.indexOf(';');
+            if (semi >= 0)
+                sizeLine = sizeLine.substring(0, semi);
+
+            unsigned long chunkSize = strtoul(sizeLine.c_str(), nullptr, 16);
+            if (chunkSize == 0)
+                break;
+
+            unsigned long read = 0;
+            unsigned long lastChunkProgressMs = millis();
+            while (read < chunkSize && keepGoing)
+            {
+                if (shouldAbort())
+                {
+                    Serial.println("wifiClientRequestStream: aborted");
+                    client.stop();
+                    return false;
+                }
+                if (client.available())
+                {
+                    size_t canRead = (size_t)(chunkSize - read);
+                    if (canRead > sizeof(buf)) canRead = sizeof(buf);
+                    int n = client.read((uint8_t *)buf, canRead);
+                    if (n > 0)
+                    {
+                        totalBytes += (size_t)n;
+                        keepGoing = (onChunk == nullptr) || onChunk(buf, (size_t)n, ctx);
+                        read += (unsigned long)n;
+                        lastChunkProgressMs = millis();
+                    }
+                }
+                else if (millis() - lastChunkProgressMs >= 10000UL)
+                {
+                    Serial.println("wifiClientRequestStream: timeout reading chunk data");
+                    break;
+                }
+                else
+                {
+                    tick();
+                    delay(1);
+                }
+            }
+            client.readStringUntil('\n');
+        }
+        flightwallStringDrop(sizeLine);
+    }
+    else
+    {
+        unsigned long lastBodyProgressMs = millis();
+        while (keepGoing && (client.connected() || client.available()))
+        {
+            if (shouldAbort())
+            {
+                Serial.println("wifiClientRequestStream: aborted");
+                client.stop();
+                return false;
+            }
+            if (client.available())
+            {
+                int n = client.read((uint8_t *)buf, sizeof(buf));
+                if (n > 0)
+                {
+                    totalBytes += (size_t)n;
+                    keepGoing = (onChunk == nullptr) || onChunk(buf, (size_t)n, ctx);
+                    lastBodyProgressMs = millis();
+                }
+            }
+            if (millis() - lastBodyProgressMs >= 15000UL)
+                break;
+            tick();
+            delay(1);
+        }
+    }
+
+    client.stop();
+    Serial.print("wifiClientRequestStream: done — code=");
+    Serial.print(outCode);
+    Serial.print(", streamed=");
+    Serial.print((unsigned long)totalBytes);
+    Serial.println(" bytes");
     return true;
 }
 #endif

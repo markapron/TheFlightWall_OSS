@@ -44,6 +44,10 @@ struct TailFlightStatus
     // Shown on the status line when the flight has landed.
     String dest_code;
 
+    // Best available origin airport code (IATA preferred, then local ID).
+    // Used for compass bearing fallback while on the ground / scheduled.
+    String origin_code;
+
     // Snapshot taken at fetch time so the display can compute elapsed time
     // without polling WiFi.getTime() on every frame.
     unsigned long fetch_epoch  = 0; // epoch at time of successful fetch
