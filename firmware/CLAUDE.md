@@ -6,6 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TheFlightWall is Arduino/PlatformIO firmware for an LED matrix flight tracker. It fetches live ADS-B data from OpenSky Network, enriches it via FlightAware AeroAPI and a custom CDN, and renders cycling flight cards on a HUB75 RGB matrix (or WS2812B NeoPixel matrix on ESP32). Two operating modes: **MODE_NEARBY** cycles through flights within a configurable radius, **MODE_TAIL_TRACKER** tracks a single aircraft by tail number.
 
+### Cost reduction
+
+AeroAPI calls are expensive and should be limited to less than 500 calls per month. Use data from OpenSky whenever possible.
+
+## git
+The git repo is in one directory up from here. Always prompt the user for approval with commit messages to ensure testing was successful.
+
 ## Build & Flash
 
 Built with **PlatformIO**. No separate install step — dependencies are declared in `platformio.ini` and fetched automatically.
@@ -82,7 +89,7 @@ All configuration lives in `config/`. The files that are most commonly edited:
 | `HardwareConfiguration.h` | HUB75 pin assignments, matrix dimensions, button pins |
 | `Secrets.h` | WiFi credentials, OpenSky OAuth, AeroAPI key, tracked tail number |
 
-`Secrets.h` is **not** in `.gitignore` — credentials are currently hardcoded there. The serial config menu (`SerialConfig`) at runtime can update WiFi/API credentials stored in flash, but `Secrets.h` remains the compile-time fallback.
+`Secrets.h` is in `.gitignore` one directory up from here — credentials are currently hardcoded there. The serial config menu (`SerialConfig`) at runtime can update WiFi/API credentials stored in flash, but `Secrets.h` remains the compile-time fallback.
 
 ## Button Behavior (Matrix Portal M4)
 

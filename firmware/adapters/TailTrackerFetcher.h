@@ -31,17 +31,32 @@ public:
     // Returns true on success; `out` is left unchanged on failure.
     bool fetchStatus(const String &ident, TailFlightStatus &out);
 
+    // Reverse-geocode lat/lon to city/region. Re-queries Nominatim at most once
+    // per POSITION_FETCH_INTERVAL_SECONDS*2; returns cached result otherwise.
+    bool fetchReverseGeocode(double lat, double lon,
+                             String &outCity, String &outRegion);
+
+    // Keep the persistent sticky position in sync with live OpenSky fixes so that
+    // when AeroAPI fetchStatus falls back to sticky (no last_position in response)
+    // it uses the most recent known location rather than a stale en-route fix.
+    static void updateStickyPosition(double lat, double lon, int altFt);
+
 private:
     OpenSkyFetcher *_openSky;
 
-    // Reverse-geocode cache — reused until the aircraft moves more than
-    // TailTrackerConfiguration::GEO_CACHE_THRESHOLD_KM.
-    double _lastGeoLat = NAN;
-    double _lastGeoLon = NAN;
+    // Cached reverse-geocode result — refreshed on a time interval.
+    unsigned long _lastGeocodeMs = 0;
     String _lastCity;
     String _lastRegion;
 
-    // Forward-geocode cache (origin / destination city → lat/lon).
+    // Falls back to GetLastTrack when last_position is absent from the
+    // flights response.  Iterates the track array and returns the most
+    // recent lat/lon/altitude.  Returns false if the track is unavailable
+    // or empty.  outAlt is set to 0 when the endpoint omits altitude.
+    bool fetchTrackPosition(const String &faFlightId,
+                            double &outLat, double &outLon, int &outAlt);
+
+    // Cache for forward geocode (identical query on each poll)
     String _lastForwardQuery;
     double _lastForwardLat = NAN;
     double _lastForwardLon = NAN;
@@ -50,9 +65,6 @@ private:
     // Updates the static route cache and returns true on success.
     bool fetchRouteFromAeroAPI(const String &ident);
 
-    // Nominatim helpers (identical to original implementation).
-    bool fetchReverseGeocode(double lat, double lon,
-                             String &outCity, String &outRegion);
     bool fetchForwardGeocodeForDestination(const String &searchQuery,
                                            double &outLat, double &outLon);
 

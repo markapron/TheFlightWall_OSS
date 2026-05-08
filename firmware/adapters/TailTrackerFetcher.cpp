@@ -12,7 +12,6 @@ Nominatim reverse-geocoding is rate-limited by a distance threshold cache.
 #include "config/APIConfiguration.h"
 #include "config/TailTrackerConfiguration.h"
 #include "utils/HttpUtils.h"
-#include "utils/GeoUtils.h"
 #include "utils/MemoryUtils.h"
 #include <stdlib.h>
 #include <string.h>
@@ -659,7 +658,153 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
 }
 
 // ---------------------------------------------------------------------------
-// Forward geocoding via Nominatim /search
+// updateStickyPosition — keep the sticky cache current from OpenSky fixes
+// ---------------------------------------------------------------------------
+
+void TailTrackerFetcher::updateStickyPosition(double lat, double lon, int altFt)
+{
+    if (isnan(lat) || isnan(lon) || (lat == 0.0 && lon == 0.0))
+        return;
+    s_stickyLat = lat;
+    s_stickyLon = lon;
+    s_stickyAlt = altFt;
+}
+
+// ---------------------------------------------------------------------------
+// GetLastTrack — fallback position when last_position is absent
+// ---------------------------------------------------------------------------
+
+bool TailTrackerFetcher::fetchTrackPosition(const String &faFlightId,
+                                             double &outLat, double &outLon,
+                                             int &outAlt)
+{
+    if (strlen(APIConfiguration::AEROAPI_KEY) == 0) return false;
+
+    const String url = String(APIConfiguration::AEROAPI_BASE_URL)
+                     + "/flights/" + faFlightId + "/track";
+    bool   https = true;
+    String host;
+    uint16_t port = 443;
+    String path;
+    if (!parseUrl(url, https, host, port, path)) return false;
+
+#if defined(FLIGHTWALL_SKIP_TLS)
+    https = false;
+    port  = 80;
+#endif
+
+    int    code = -1;
+    String payload;
+
+#if defined(ARDUINO_ARCH_ESP32)
+    {
+        TailTlsClient net;
+#if !defined(FLIGHTWALL_SKIP_TLS)
+        if (APIConfiguration::AEROAPI_INSECURE_TLS) net.setInsecure();
+#endif
+        HttpClient http(net, host.c_str(), port);
+        http.setHttpResponseTimeout(30000);
+        http.beginRequest();
+        http.get(path);
+        http.sendHeader("x-apikey", APIConfiguration::AEROAPI_KEY);
+        http.sendHeader("Accept",   "application/json");
+        http.endRequest();
+        code    = http.responseStatusCode();
+        payload = http.responseBody();
+    }
+#else
+    {
+        const String hdrs = String("x-apikey: ") + APIConfiguration::AEROAPI_KEY
+                          + "\r\nAccept: application/json\r\n";
+        TrackStreamParser parser;
+        if (!wifiClientRequestStream("GET", host, port, path, hdrs, "", code,
+                                     trackStreamOnChunk, &parser))
+        {
+            Serial.println("TailTrackerFetcher: track request failed");
+            return false;
+        }
+        if (parser.pendingKey != nullptr && parser.readingValue)
+            trackParserCommitValue(parser);
+        if (code != 200)
+        {
+            Serial.print("TailTrackerFetcher: track HTTP ");
+            Serial.println(code);
+            return false;
+        }
+        if (!hasPlausibleAircraftPosition(parser.lastLat, parser.lastLon))
+        {
+            Serial.println("TailTrackerFetcher: track positions array empty");
+            return false;
+        }
+        outLat = parser.lastLat;
+        outLon = parser.lastLon;
+        outAlt = parser.lastAlt;
+        return true;
+    }
+#endif
+
+    if (code != 200)
+    {
+        Serial.print("TailTrackerFetcher: track HTTP ");
+        Serial.println(code);
+        flightwallStringDrop(payload);
+        return false;
+    }
+
+    JsonDocument trackFilter;
+    trackFilter["positions"][0]["latitude"]  = true;
+    trackFilter["positions"][0]["longitude"] = true;
+    trackFilter["positions"][0]["altitude"]  = true;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload,
+                                               DeserializationOption::Filter(trackFilter));
+    flightwallStringDrop(payload);
+    if (err)
+    {
+        Serial.print("TailTrackerFetcher: track JSON parse error: ");
+        Serial.println(err.c_str());
+        return false;
+    }
+
+    JsonArray positions = doc["positions"].as<JsonArray>();
+    if (positions.isNull() || positions.size() == 0)
+    {
+        Serial.println("TailTrackerFetcher: track positions array empty");
+        doc.clear();
+        return false;
+    }
+
+    // Positions are ascending in time; last entry is most recent.
+    // Track altitude is in hundreds of feet (e.g. 360 = FL360 = 36,000 ft).
+    double lastLat = NAN, lastLon = NAN;
+    int    lastAlt = 0;
+    for (JsonObject pos : positions)
+    {
+        if (!pos["latitude"].isNull() && !pos["longitude"].isNull())
+        {
+            lastLat = pos["latitude"].as<double>();
+            lastLon = pos["longitude"].as<double>();
+            if (!pos["altitude"].isNull())
+                lastAlt = pos["altitude"].as<int>() * 100;
+        }
+    }
+
+    if (isnan(lastLat) || isnan(lastLon))
+    {
+        doc.clear();
+        return false;
+    }
+
+    outLat = lastLat;
+    outLon = lastLon;
+    outAlt = lastAlt;
+    doc.clear();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Forward geocoding via Nominatim /search (arrival city → lat/lon for compass)
 // ---------------------------------------------------------------------------
 
 bool TailTrackerFetcher::fetchForwardGeocodeForDestination(const String &searchQuery,
@@ -746,13 +891,14 @@ bool TailTrackerFetcher::fetchForwardGeocodeForDestination(const String &searchQ
 bool TailTrackerFetcher::fetchReverseGeocode(double lat, double lon,
                                               String &outCity, String &outRegion)
 {
-    if (!isnan(_lastGeoLat) && !isnan(_lastGeoLon)) {
-        if (haversineKm(_lastGeoLat, _lastGeoLon, lat, lon)
-                < TailTrackerConfiguration::GEO_CACHE_THRESHOLD_KM) {
-            outCity   = _lastCity;
-            outRegion = _lastRegion;
-            return true;
-        }
+    // Re-query Nominatim at most once per POSITION_FETCH_INTERVAL_SECONDS*2.
+    const unsigned long geocodeIntervalMs =
+        TailTrackerConfiguration::POSITION_FETCH_INTERVAL_SECONDS * 2UL * 1000UL;
+    if (_lastGeocodeMs != 0 && (millis() - _lastGeocodeMs) < geocodeIntervalMs)
+    {
+        outCity   = _lastCity;
+        outRegion = _lastRegion;
+        return true;
     }
 
     const String   host = "nominatim.openstreetmap.org";
@@ -826,8 +972,9 @@ bool TailTrackerFetcher::fetchReverseGeocode(double lat, double lon,
 
     outCity   = city;
     outRegion = region;
-    _lastGeoLat = lat; _lastGeoLon = lon;
-    _lastCity   = city; _lastRegion = region;
+    _lastGeocodeMs = millis();
+    _lastCity      = city;
+    _lastRegion    = region;
     geo.clear();
     return true;
 }

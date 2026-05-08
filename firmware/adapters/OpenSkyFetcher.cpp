@@ -222,6 +222,12 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
                                        double radiusKm,
                                        std::vector<StateVector> &outStateVectors)
 {
+    if (m_rateLimitBackoffUntilMs != 0 && millis() < m_rateLimitBackoffUntilMs)
+    {
+        Serial.println("OpenSkyFetcher: rate-limit backoff, skipping fetchStateVectors");
+        return false;
+    }
+
     // Ensure OAuth token if configured
     if (!ensureAccessToken(false))
     {
@@ -298,19 +304,23 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
         }
     }
 
+    if (code == 429)
+    {
+        m_rateLimitBackoffUntilMs = millis() + 5UL * 60UL * 1000UL;
+        Serial.println("OpenSkyFetcher: 429 rate-limited; backing off 5 min");
+    }
     if (code != 200)
     {
         Serial.print("OpenSkyFetcher: HTTP request failed with code: ");
         Serial.println(code);
+        flightwallStringDrop(payload);
         return false;
     }
 
-    // The OpenSky states response is ~20-25 KB of JSON. ArduinoJson needs roughly
-    // 1.5x the raw JSON size for its internal representation. 48 KB is safe on the
-    // SAMD51's 192 KB of RAM, provided we free the raw payload string first.
+    // Reuse the persistent member document — no heap alloc/free on this hot path.
     const size_t payloadBytes = payload.length();
-    DynamicJsonDocument doc(49152);
-    DeserializationError err = deserializeJson(doc, payload);
+    m_statesDoc.clear();
+    DeserializationError err = deserializeJson(m_statesDoc, payload);
     flightwallStringDrop(payload);
     if (err)
     {
@@ -319,14 +329,14 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
         Serial.print(" (payload length: ");
         Serial.print((unsigned)payloadBytes);
         Serial.println(")");
-        doc.clear();
+        m_statesDoc.clear();
         return false;
     }
 
-    JsonArray states = doc["states"].as<JsonArray>();
+    JsonArray states = m_statesDoc["states"].as<JsonArray>();
     if (states.isNull())
     {
-        doc.clear();
+        m_statesDoc.clear();
         return true; // no states is not an error
     }
 
@@ -378,46 +388,42 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
         outStateVectors.push_back(s);
     }
 
-    doc.clear();
+    m_statesDoc.clear();
     return true;
 }
 
-bool OpenSkyFetcher::fetchByIcao24(const String &icao24Hex, StateVector &outState)
-{
-    if (icao24Hex.length() == 0)
-        return false;
+// ---------------------------------------------------------------------------
+// fetchAndFindAircraft — shared GET + parse helper for single-aircraft lookups.
+// path is appended to OPENSKY_BASE_URL. matchCallsign empty = accept any first state.
+// ---------------------------------------------------------------------------
 
-    if (!ensureAccessToken(false))
+bool OpenSkyFetcher::fetchAndFindAircraft(const String &path,
+                                           const String &matchCallsign,
+                                           StateVector &outSV,
+                                           bool useSharedDoc)
+{
+    if (m_rateLimitBackoffUntilMs != 0 && millis() < m_rateLimitBackoffUntilMs)
     {
-        Serial.println("OpenSkyFetcher: ensureAccessToken failed (fetchByIcao24)");
+        Serial.println("OpenSkyFetcher: rate-limit backoff, skipping fetch");
         return false;
     }
-
-    // Global query filtered by ICAO24 — no bbox needed; response is ≤1 entry.
-    const String url = String(APIConfiguration::OPENSKY_BASE_URL)
-                     + "/api/states/all?icao24=" + icao24Hex;
 
     bool https = true;
     String host;
     uint16_t port = 443;
-    String path;
-    if (!parseUrl(url, https, host, port, path))
+    String parsedPath;
+    const String url = String(APIConfiguration::OPENSKY_BASE_URL) + path;
+    if (!parseUrl(url, https, host, port, parsedPath))
     {
-        Serial.println("OpenSkyFetcher: Failed to parse icao24 URL");
+        Serial.println("OpenSkyFetcher: Failed to parse find URL");
         return false;
     }
 #if defined(FLIGHTWALL_SKIP_TLS)
     https = false;
-    port = 80;
-#else
-    if (!https)
-    {
-        Serial.println("OpenSkyFetcher: Refusing non-HTTPS icao24 URL");
-        return false;
-    }
+    port  = 80;
 #endif
 
-    int code = -1;
+    int    code = -1;
     String payload;
 
     auto doGet = [&]() -> bool {
@@ -426,91 +432,151 @@ bool OpenSkyFetcher::fetchByIcao24(const String &icao24Hex, StateVector &outStat
         HttpClient http(net, host.c_str(), port);
         http.setHttpResponseTimeout(30000);
         http.beginRequest();
-        http.get(path);
+        http.get(parsedPath);
         http.sendHeader("Authorization", String("Bearer ") + m_accessToken);
         http.endRequest();
         code    = http.responseStatusCode();
         payload = http.responseBody();
         return true;
 #else
-        const String extraHeaders = String("Authorization: Bearer ") + m_accessToken
-                                  + "\r\nAccept: application/json\r\n";
-        return wifiClientRequest("GET", host, port, path, extraHeaders, "", code, payload);
+        const String hdrs = String("Authorization: Bearer ") + m_accessToken
+                          + "\r\nAccept: application/json\r\n";
+        return wifiClientRequest("GET", host, port, parsedPath, hdrs, "", code, payload);
 #endif
     };
 
-    if (!doGet())
-    {
-        Serial.println("OpenSkyFetcher: icao24 GET failed");
-        return false;
-    }
+    if (!doGet()) return false;
     if (code == 401 && ensureAccessToken(true))
     {
         flightwallStringDrop(payload);
-        if (!doGet())
-        {
-            Serial.println("OpenSkyFetcher: icao24 GET retry failed");
-            return false;
-        }
+        if (!doGet()) return false;
+    }
+    if (code == 429)
+    {
+        m_rateLimitBackoffUntilMs = millis() + 5UL * 60UL * 1000UL;
+        Serial.println("OpenSkyFetcher: 429 rate-limited; backing off 5 min");
     }
     if (code != 200)
     {
-        Serial.print("OpenSkyFetcher: icao24 HTTP ");
+        Serial.print("OpenSkyFetcher: find HTTP ");
         Serial.println(code);
         flightwallStringDrop(payload);
         return false;
     }
 
-    // Single-aircraft response is small; 4 KB is ample.
-    DynamicJsonDocument doc(4096);
-    DeserializationError err = deserializeJson(doc, payload);
-    flightwallStringDrop(payload);
-    if (err)
-    {
-        Serial.print("OpenSkyFetcher: icao24 JSON error: ");
-        Serial.println(err.c_str());
+    // Parse using either the persistent member doc (bounding-box responses that can
+    // be large) or a small local doc (single icao24 response, ~300 bytes of JSON).
+    auto parseStates = [&](JsonDocument &doc) -> bool {
+        DeserializationError err = deserializeJson(doc, payload);
+        flightwallStringDrop(payload);
+        if (err)
+        {
+            Serial.print("OpenSkyFetcher: find JSON parse error: ");
+            Serial.println(err.c_str());
+            doc.clear();
+            return false;
+        }
+
+        JsonArray states = doc["states"].as<JsonArray>();
+        if (states.isNull() || states.size() == 0)
+        {
+            doc.clear();
+            return false;
+        }
+
+        String needle = matchCallsign;
+        needle.trim();
+        needle.toUpperCase();
+
+        for (JsonVariant v : states)
+        {
+            if (!v.is<JsonArray>()) continue;
+            JsonArray a = v.as<JsonArray>();
+            if (a.size() < 17) continue;
+            if (a[6].isNull() || a[5].isNull()) continue;
+
+            if (needle.length() > 0)
+            {
+                String cs = a[1].isNull() ? String("") : String(a[1].as<const char *>());
+                cs.trim();
+                cs.toUpperCase();
+                if (cs != needle) continue;
+            }
+
+            StateVector s;
+            s.icao24          = a[0].isNull() ? String("") : String(a[0].as<const char *>());
+            s.callsign        = a[1].isNull() ? String("") : String(a[1].as<const char *>());
+            s.callsign.trim();
+            s.origin_country  = a[2].isNull() ? String("") : String(a[2].as<const char *>());
+            s.time_position   = a[3].isNull() ? 0 : a[3].as<long>();
+            s.last_contact    = a[4].isNull() ? 0 : a[4].as<long>();
+            s.lon             = a[5].as<double>();
+            s.lat             = a[6].as<double>();
+            s.baro_altitude   = a[7].isNull() ? NAN : a[7].as<double>();
+            s.on_ground       = a[8].isNull() ? false : a[8].as<bool>();
+            s.velocity        = a[9].isNull() ? NAN : a[9].as<double>();
+            s.heading         = a[10].isNull() ? NAN : a[10].as<double>();
+            s.vertical_rate   = a[11].isNull() ? NAN : a[11].as<double>();
+            s.sensors         = a[12].isNull() ? 0 : a[12].as<long>();
+            s.geo_altitude    = a[13].isNull() ? NAN : a[13].as<double>();
+            s.squawk          = a[14].isNull() ? String("") : String(a[14].as<const char *>());
+            s.spi             = a[15].isNull() ? false : a[15].as<bool>();
+            s.position_source = a[16].isNull() ? 0 : a[16].as<int>();
+
+            if (isnan(s.lat) || isnan(s.lon)) continue;
+
+            outSV = s;
+            doc.clear();
+            return true;
+        }
+
         doc.clear();
         return false;
-    }
+    };
 
-    JsonArray states = doc["states"].as<JsonArray>();
-    if (states.isNull() || states.size() == 0)
+    if (useSharedDoc)
     {
-        doc.clear();
-        return false; // aircraft not currently transmitting / outside coverage
+        m_statesDoc.clear();
+        return parseStates(m_statesDoc);
     }
-
-    JsonArray a = states[0].as<JsonArray>();
-    if (a.isNull() || a.size() < 17)
+    else
     {
-        doc.clear();
-        return false;
+        DynamicJsonDocument smallDoc(1024);
+        return parseStates(smallDoc);
     }
+}
 
-    StateVector s;
-    s.icao24          = icao24Hex;
-    s.callsign        = a[1].isNull() ? String("") : String(a[1].as<const char *>());
-    s.callsign.trim();
-    s.origin_country  = a[2].isNull() ? String("") : String(a[2].as<const char *>());
-    s.time_position   = a[3].isNull() ? 0    : a[3].as<long>();
-    s.last_contact    = a[4].isNull() ? 0    : a[4].as<long>();
-    s.lon             = a[5].isNull() ? NAN  : a[5].as<double>();
-    s.lat             = a[6].isNull() ? NAN  : a[6].as<double>();
-    s.baro_altitude   = a[7].isNull() ? NAN  : a[7].as<double>();
-    s.on_ground       = a[8].isNull() ? false : a[8].as<bool>();
-    s.velocity        = a[9].isNull() ? NAN  : a[9].as<double>();
-    s.heading         = a[10].isNull() ? NAN : a[10].as<double>();
-    s.vertical_rate   = a[11].isNull() ? NAN : a[11].as<double>();
-    s.geo_altitude    = a[13].isNull() ? NAN : a[13].as<double>();
-    s.squawk          = a[14].isNull() ? String("") : String(a[14].as<const char *>());
-    s.spi             = a[15].isNull() ? false : a[15].as<bool>();
-    s.position_source = a[16].isNull() ? 0   : a[16].as<int>();
+bool OpenSkyFetcher::fetchByIcao24(const String &icao24Hex, StateVector &outState)
+{
+    return findAircraftByIcao24(icao24Hex, outState);
+}
 
-    doc.clear();
+bool OpenSkyFetcher::findAircraftByCallsign(const String &callsign,
+                                             double centerLat, double centerLon,
+                                             double radiusKm, StateVector &outSV)
+{
+    if (!ensureAccessToken(false)) return false;
 
-    if (isnan(s.lat) || isnan(s.lon))
-        return false;
+    double latMin, latMax, lonMin, lonMax;
+    centeredBoundingBox(centerLat, centerLon, radiusKm, latMin, latMax, lonMin, lonMax);
 
-    outState = s;
-    return true;
+    const String path = String("/api/states/all?lamin=") + String(latMin, 6)
+                      + "&lamax=" + String(latMax, 6)
+                      + "&lomin=" + String(lonMin, 6)
+                      + "&lomax=" + String(lonMax, 6);
+
+    Serial.print("OpenSkyFetcher: callsign search for ");
+    Serial.println(callsign);
+    return fetchAndFindAircraft(path, callsign, outSV, true);  // reuse m_statesDoc
+}
+
+bool OpenSkyFetcher::findAircraftByIcao24(const String &icao24, StateVector &outSV)
+{
+    if (!ensureAccessToken(false)) return false;
+
+    const String path = String("/api/states/all?icao24=") + icao24;
+
+    Serial.print("OpenSkyFetcher: icao24 lookup ");
+    Serial.println(icao24);
+    return fetchAndFindAircraft(path, "", outSV, false);  // small local doc
 }

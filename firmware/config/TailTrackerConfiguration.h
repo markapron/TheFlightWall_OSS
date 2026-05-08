@@ -10,8 +10,14 @@ namespace TailTrackerConfiguration
     // numbers are both accepted.  Set the value in config/Secrets.h.
     static const char *TRACKED_TAIL_NUMBER = SECRET_TRACKED_TAIL_NUMBER;
 
-    // How often to refresh tail tracker data while in tail tracker mode (seconds).
-    static const unsigned long FETCH_INTERVAL_SECONDS = 60;
+    // How often to refresh AeroAPI enrichment data (route, status, timestamps) in seconds.
+    static const unsigned long ENRICHMENT_FETCH_INTERVAL_SECONDS = 300;
+
+    // How often to poll OpenSky for a live position update in tail tracker mode (seconds).
+    static const unsigned long POSITION_FETCH_INTERVAL_SECONDS = 30;
+
+    // Bounding-box search radius for OpenSky callsign lookup when ICAO24 is not yet cached.
+    static const double POSITION_SEARCH_RADIUS_KM = 400.0;
 
     // Minimum time between full matrix redraws in tail mode (avoids String churn /
     // heap fragmentation from repainting at loop() rate; elapsed time on screen
@@ -21,7 +27,4 @@ namespace TailTrackerConfiguration
     // Serial log interval for free-RAM reporting while in tail mode (0 = disabled).
     static const unsigned long MEM_LOG_INTERVAL_MS = 60000;
 
-    // Reverse-geocode cache threshold: only re-query Nominatim when the
-    // aircraft has moved more than this distance since the last geocode (km).
-    static const double GEO_CACHE_THRESHOLD_KM = 50.0;
 }

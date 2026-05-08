@@ -95,7 +95,9 @@ static std::vector<FlightInfo> &g_cachedFlights = g_nearbyPool;
 
 // MODE_TAIL_TRACKER state
 static TailFlightStatus  g_tailStatus;
-static unsigned long     g_lastTailFetchMs  = 0;
+static unsigned long     g_lastTailFetchMs         = 0;  // AeroAPI enrichment timer
+static unsigned long     g_lastTailPositionFetchMs = 0;  // OpenSky position timer
+static String            g_cachedTailIcao24;              // transponder hex for direct lookup
 static unsigned long     g_lastTailRedrawMs = 0;
 static unsigned long     g_lastMemLogMs     = 0;
 
@@ -740,8 +742,95 @@ void loop()
     // --- MODE_TAIL_TRACKER: fetch status for the configured tail number ---
     else if (g_appMode == MODE_TAIL_TRACKER)
     {
+        // --- OpenSky position update (every 30 s) ---
+        // Runs once a valid AeroAPI enrichment has populated an initial position.
+        // Clear cached ICAO24 when the tracked tail number changes (e.g. SerialConfig edit).
+        {
+            static String s_lastPositionTail;
+            if (SerialConfig::tailNumber != s_lastPositionTail)
+            {
+                g_cachedTailIcao24  = "";
+                s_lastPositionTail  = SerialConfig::tailNumber;
+            }
+        }
+
+        const unsigned long posIntervalMs =
+            TailTrackerConfiguration::POSITION_FETCH_INTERVAL_SECONDS * 1000UL;
+
+        if (g_tailStatus.valid
+            && !isnan(g_tailStatus.lat) && !isnan(g_tailStatus.lon)
+            && !(g_tailStatus.lat == 0.0 && g_tailStatus.lon == 0.0)
+            && WiFi.status() == WL_CONNECTED
+            && (g_lastTailPositionFetchMs == 0
+                || now - g_lastTailPositionFetchMs >= posIntervalMs))
+        {
+            StateVector sv;
+            bool found = false;
+            g_requestMode = MODE_TAIL_TRACKER;
+
+            // Once the icao24 is cached use the direct single-aircraft query.
+            // Do NOT fall back to the bounding-box callsign search on a miss:
+            // a miss just means the aircraft is temporarily off OpenSky, and the
+            // bounding-box response is large enough to fragment the heap over a
+            // long run if it fires on every 30-second interval.
+            if (g_cachedTailIcao24.length() > 0)
+                found = g_openSky.findAircraftByIcao24(g_cachedTailIcao24, sv);
+            else
+                found = g_openSky.findAircraftByCallsign(
+                    SerialConfig::tailNumber,
+                    g_tailStatus.lat, g_tailStatus.lon,
+                    TailTrackerConfiguration::POSITION_SEARCH_RADIUS_KM, sv);
+
+            if (g_appMode == MODE_TAIL_TRACKER && found)
+            {
+                if (g_cachedTailIcao24.length() == 0)
+                    g_cachedTailIcao24 = sv.icao24;
+
+                g_tailStatus.lat         = sv.lat;
+                g_tailStatus.lon         = sv.lon;
+                if (!isnan(sv.baro_altitude))
+                    g_tailStatus.altitude_ft = (int)(sv.baro_altitude * 3.28084f);
+
+                // Keep TailTrackerFetcher's sticky cache current so that the next
+                // AeroAPI enrichment (which falls back to sticky when last_position
+                // is absent) uses this fresh fix rather than a stale en-route position.
+                TailTrackerFetcher::updateStickyPosition(
+                    sv.lat, sv.lon, g_tailStatus.altitude_ft);
+
+                // Geocode runs inside the requestMode guard so a mode-switch during
+                // the Nominatim call is handled consistently with fetchStatus.
+                g_tailFetcher.fetchReverseGeocode(sv.lat, sv.lon,
+                                                   g_tailStatus.city, g_tailStatus.region);
+
+                // OpenSky detects landing before AeroAPI does — force an immediate
+                // enrichment fetch so we get destination airport data right away.
+                // Guard on actual_off_epoch > 0: aircraft must have already departed
+                // or the condition also fires while it is parked pre-departure.
+                if (sv.on_ground
+                    && g_tailStatus.actual_off_epoch > 0
+                    && g_tailStatus.actual_on_epoch == 0)
+                    g_lastTailFetchMs = 0;
+
+                tailTrackerRedrawIfDue(true);
+                Serial.print("TailPos: lat=");
+                Serial.print(g_tailStatus.lat, 4);
+                Serial.print(" lon=");
+                Serial.print(g_tailStatus.lon, 4);
+                Serial.print(" alt=");
+                Serial.print(g_tailStatus.altitude_ft);
+                Serial.print("ft on_ground=");
+                Serial.println(sv.on_ground ? "Y" : "N");
+            }
+
+            g_requestMode = MODE_COUNT;
+            g_lastTailPositionFetchMs = millis();
+        }
+
+        if (g_appMode != MODE_TAIL_TRACKER) { delay(10); return; }
+
+        // --- AeroAPI enrichment (every 5 min) ---
         const unsigned long tailIntervalMs =
-            TailTrackerConfiguration::FETCH_INTERVAL_SECONDS * 1000UL;
+            TailTrackerConfiguration::ENRICHMENT_FETCH_INTERVAL_SECONDS * 1000UL;
 
         if ((g_lastTailFetchMs == 0 || now - g_lastTailFetchMs >= tailIntervalMs) &&
             WiFi.status() == WL_CONNECTED)
@@ -789,6 +878,20 @@ void loop()
                     if (g_tallyCount < 99) ++g_tallyCount;
                 }
                 g_prevIsAirborne = newIsAirborne;
+
+                // AeroAPI's last_position is the final en-route fix, not the airport.
+                // When landing is confirmed and OpenSky already put us on the ground,
+                // keep that position so the display shows the correct airport distance.
+                if (newStatus.actual_on_epoch > 0
+                    && g_tailStatus.valid
+                    && !isnan(g_tailStatus.lat) && !isnan(g_tailStatus.lon)
+                    && !(g_tailStatus.lat == 0.0 && g_tailStatus.lon == 0.0))
+                {
+                    newStatus.lat         = g_tailStatus.lat;
+                    newStatus.lon         = g_tailStatus.lon;
+                    newStatus.altitude_ft = 0;
+                    TailTrackerFetcher::updateStickyPosition(newStatus.lat, newStatus.lon, 0);
+                }
 
                 g_tailStatus = newStatus;
                 tailTrackerRedrawIfDue(true);
