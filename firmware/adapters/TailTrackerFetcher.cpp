@@ -1,15 +1,9 @@
 /*
-Purpose: Fetch real-time status for a tracked tail number from AeroAPI and
-         use Nominatim for both reverse- (aircraft) and forward- (arrival) geocodes.
-Responsibilities:
-- GET /flights/{ident} from AeroAPI; parse status, progress, timestamps, last position.
-- GET Nominatim /reverse for city/state from live lat/lon when available.
-- GET Nominatim /search to resolve arrival city/dest code to dest_lat/dest_lon when
-  landed and the API omits destination airport coordinates (compass on Matrix display).
-- Cache results where appropriate to limit rate to Nominatim.
-- Sticky per-tail (request ident) last lat/lon/alt when a poll omits last_position;
-  not cleared for new flight legs for the same tail; cleared when the configured
-  tail ident changes.
+Purpose: Fetch real-time status for a tracked tail number.
+AeroAPI is called ONCE per flight leg to obtain route metadata (origin, destination,
+timestamps).  All subsequent position updates use OpenSky via fetchByIcao24(), which
+is free and requires no API key.  Flight progress is computed geometrically.
+Nominatim reverse-geocoding is rate-limited by a distance threshold cache.
 */
 #include "adapters/TailTrackerFetcher.h"
 
@@ -37,46 +31,52 @@ Responsibilities:
 #endif
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Constants
 // ---------------------------------------------------------------------------
 
-// Parse ISO 8601 UTC timestamps of the form "YYYY-MM-DDTHH:MM:SSZ" (or with
-// a numeric timezone offset) into a Unix epoch value (seconds since 1970).
-// Returns 0 on parse failure or for dates before 2020 (likely junk).
-static unsigned long parseISO8601(const String &s)
-{
-    if (s.length() < 19) return 0;
+// How long to keep cached route data before forcing an AeroAPI refresh.
+static const unsigned long ROUTE_REFRESH_INTERVAL_MS = 6UL * 3600UL * 1000UL; // 6 h
 
-    int year  = s.substring(0,  4).toInt();
-    int month = s.substring(5,  7).toInt();
-    int day   = s.substring(8,  10).toInt();
-    int hour  = s.substring(11, 13).toInt();
-    int mn    = s.substring(14, 16).toInt();
-    int sec   = s.substring(17, 19).toInt();
+// ---------------------------------------------------------------------------
+// Static route cache (shared across all TailTrackerFetcher instances)
+// ---------------------------------------------------------------------------
 
-    if (year < 2020 || month < 1 || month > 12 || day < 1 || day > 31) return 0;
+static String        s_trackedIdent;         // ident this cache belongs to
+static bool          s_routeValid     = false;
+static bool          s_routeNeedsRefresh = true;
+static unsigned long s_routeFetchMs   = 0;
+static String        s_cachedIcao24;          // 6 hex chars; empty = unknown
 
-    static const int kDim[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    bool leap = (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0);
+// Route data from AeroAPI
+static String        s_cachedIdent;
+static String        s_cachedOriginCode;
+static String        s_cachedDestCode;
+static double        s_cachedOriginLat = NAN;
+static double        s_cachedOriginLon = NAN;
+static double        s_cachedDestLat   = NAN;
+static double        s_cachedDestLon   = NAN;
+static String        s_cachedOriginCity;
+static String        s_cachedOriginRegion;
+static String        s_cachedDestCity;
+static String        s_cachedDestRegion;
+static String        s_cachedStatus;
+static unsigned long s_cachedActualOff    = 0;
+static unsigned long s_cachedActualOn     = 0;
+static unsigned long s_cachedScheduledOff = 0;
+static unsigned long s_cachedFetchEpoch   = 0;
+static unsigned long s_cachedFetchMillis  = 0;
 
-    // Days elapsed from 1970-01-01 to the start of `year`.
-    long days = (long)(year - 1970) * 365L
-              + (long)((year - 1969) / 4)
-              - (long)((year - 1901) / 100)
-              + (long)((year - 1601) / 400);
+// Last known good aircraft position (across calls / leg transitions)
+static double        s_stickyLat = NAN;
+static double        s_stickyLon = NAN;
+static int           s_stickyAlt = 0;
 
-    for (int m = 1; m < month; ++m)
-    {
-        days += kDim[m];
-        if (m == 2 && leap) ++days;
-    }
-    days += day - 1;
+// Was the aircraft airborne on the previous successful OpenSky poll?
+static bool          s_wasAirborne = false;
 
-    return (unsigned long)(days * 86400L
-                         + (long)hour * 3600L
-                         + (long)mn   * 60L
-                         + (long)sec);
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 static String safeStr(JsonVariant v, const char *key)
 {
@@ -84,231 +84,157 @@ static String safeStr(JsonVariant v, const char *key)
     return String(v[key].as<const char *>());
 }
 
-// AeroAPI sometimes omits a real last_position and sends 0,0. That is not a valid
-// aircraft fix; treat it as missing so we fall through to GetLastTrack and pick up
-// city/region from the track + Nominatim path instead of geocoding the Gulf of Guinea.
-static bool hasPlausibleAircraftPosition(double lat, double lon)
+static bool hasPlausibleLatLon(double lat, double lon)
 {
-    if (isnan(lat) || isnan(lon))
-        return false;
-    if (lat == 0.0 && lon == 0.0)
-        return false;
+    if (isnan(lat) || isnan(lon))   return false;
+    if (lat == 0.0 && lon == 0.0)  return false;
     return true;
 }
 
-#if !defined(ARDUINO_ARCH_ESP32)
-struct TrackStreamParser
+// Parse ISO 8601 UTC "YYYY-MM-DDTHH:MM:SSZ" → Unix epoch.  Returns 0 on failure.
+static unsigned long parseISO8601(const String &s)
 {
-    double currentLat = NAN;
-    double currentLon = NAN;
-    int    currentAlt = 0;
-    double lastLat = NAN;
-    double lastLon = NAN;
-    int    lastAlt = 0;
-
-    const char *pendingKey = nullptr;
-    int matchLat = 0;
-    int matchLon = 0;
-    int matchAlt = 0;
-    bool waitingColon = false;
-    bool readingValue = false;
-    char valueBuf[24];
-    uint8_t valueLen = 0;
-};
-
-static void trackParserCommitValue(TrackStreamParser &p)
-{
-    p.valueBuf[p.valueLen] = '\0';
-    const double v = atof(p.valueBuf);
-    if (strcmp(p.pendingKey, "lat") == 0)
-        p.currentLat = v;
-    else if (strcmp(p.pendingKey, "lon") == 0)
-    {
-        p.currentLon = v;
-        if (hasPlausibleAircraftPosition(p.currentLat, p.currentLon))
-        {
-            p.lastLat = p.currentLat;
-            p.lastLon = p.currentLon;
-            p.lastAlt = p.currentAlt;
-        }
-    }
-    else if (strcmp(p.pendingKey, "alt") == 0)
-    {
-        // Track endpoint altitude is in hundreds of feet.
-        p.currentAlt = (int)lround(v * 100.0);
-        if (hasPlausibleAircraftPosition(p.currentLat, p.currentLon))
-            p.lastAlt = p.currentAlt;
-    }
-
-    p.pendingKey = nullptr;
-    p.waitingColon = false;
-    p.readingValue = false;
-    p.valueLen = 0;
+    if (s.length() < 19) return 0;
+    int year  = s.substring(0,  4).toInt();
+    int month = s.substring(5,  7).toInt();
+    int day   = s.substring(8, 10).toInt();
+    int hour  = s.substring(11,13).toInt();
+    int mn    = s.substring(14,16).toInt();
+    int sec   = s.substring(17,19).toInt();
+    if (year < 2020 || month < 1 || month > 12 || day < 1 || day > 31) return 0;
+    static const int kDim[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    bool leap = (year%4==0) && (year%100!=0 || year%400==0);
+    long days = (long)(year-1970)*365L + (long)((year-1969)/4) - (long)((year-1901)/100) + (long)((year-1601)/400);
+    for (int m=1; m<month; ++m) { days += kDim[m]; if (m==2 && leap) ++days; }
+    days += day-1;
+    return (unsigned long)(days*86400L + (long)hour*3600L + (long)mn*60L + (long)sec);
 }
 
-static void updateKeyMatch(char c, const char *pattern, int &idx, const char *key,
-                           TrackStreamParser &p)
+static void extractAirportLatLon(JsonObject obj, double &outLat, double &outLon)
 {
-    if (c == pattern[idx])
-    {
-        idx++;
-        if (pattern[idx] == '\0')
-        {
-            p.pendingKey = key;
-            p.waitingColon = true;
-            p.readingValue = false;
-            p.valueLen = 0;
-            idx = 0;
-        }
-    }
-    else
-    {
-        idx = (c == pattern[0]) ? 1 : 0;
-    }
-}
-
-static bool trackStreamOnChunk(const char *data, size_t len, void *ctx)
-{
-    TrackStreamParser &p = *static_cast<TrackStreamParser *>(ctx);
-    static const char kLat[] = "\"latitude\"";
-    static const char kLon[] = "\"longitude\"";
-    static const char kAlt[] = "\"altitude\"";
-
-    for (size_t i = 0; i < len; ++i)
-    {
-        const char c = data[i];
-
-        if (p.pendingKey != nullptr)
-        {
-            if (p.waitingColon)
-            {
-                if (c == ':')
-                    p.waitingColon = false;
-                continue;
-            }
-
-            const bool valueChar =
-                (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.';
-            if (valueChar)
-            {
-                p.readingValue = true;
-                if (p.valueLen < sizeof(p.valueBuf) - 1)
-                    p.valueBuf[p.valueLen++] = c;
-                continue;
-            }
-
-            if (p.readingValue)
-                trackParserCommitValue(p);
-            continue;
-        }
-
-        updateKeyMatch(c, kLat, p.matchLat, "lat", p);
-        updateKeyMatch(c, kLon, p.matchLon, "lon", p);
-        updateKeyMatch(c, kAlt, p.matchAlt, "alt", p);
-    }
-
-    return true;
-}
-#endif
-
-static void extractAirportLatLon(JsonObject airportObj, double &outLat, double &outLon)
-{
-    // AeroAPI field shapes can vary; try common layouts.
-    double lat = NAN, lon = NAN;
-
     auto tryGet = [](JsonVariant v, const char *key, double &out) -> bool {
         if (v.isNull() || v[key].isNull()) return false;
         out = v[key].as<double>();
         return true;
     };
-
-    if (tryGet(airportObj, "latitude", lat))  outLat = lat;
-    if (tryGet(airportObj, "longitude", lon)) outLon = lon;
-    if (!isnan(outLat) && !isnan(outLon)) return;
-
-    if (tryGet(airportObj, "lat", lat)) outLat = lat;
-    if (tryGet(airportObj, "lon", lon)) outLon = lon;
-    if (tryGet(airportObj, "lng", lon)) outLon = lon;
-    if (!isnan(outLat) && !isnan(outLon)) return;
-
-    if (!airportObj["position"].isNull() && airportObj["position"].is<JsonObject>())
-    {
-        JsonObject pos = airportObj["position"].as<JsonObject>();
-        if (tryGet(pos, "lat", lat)) outLat = lat;
-        if (tryGet(pos, "lon", lon)) outLon = lon;
-        if (tryGet(pos, "lng", lon)) outLon = lon;
-        if (tryGet(pos, "latitude", lat)) outLat = lat;
-        if (tryGet(pos, "longitude", lon)) outLon = lon;
-        if (!isnan(outLat) && !isnan(outLon)) return;
+    if (tryGet(obj, "latitude", outLat) && tryGet(obj, "longitude", outLon)) return;
+    if (tryGet(obj, "lat", outLat) && (tryGet(obj, "lon", outLon) || tryGet(obj, "lng", outLon))) return;
+    if (!obj["position"].isNull() && obj["position"].is<JsonObject>()) {
+        JsonObject pos = obj["position"].as<JsonObject>();
+        tryGet(pos, "lat", outLat); tryGet(pos, "lon", outLon); tryGet(pos, "lng", outLon);
+        tryGet(pos, "latitude", outLat); tryGet(pos, "longitude", outLon);
     }
-
-    if (!airportObj["airport"].isNull() && airportObj["airport"].is<JsonObject>())
-    {
-        JsonObject inner = airportObj["airport"].as<JsonObject>();
-        if (tryGet(inner, "latitude", lat))  outLat = lat;
-        if (tryGet(inner, "longitude", lon)) outLon = lon;
-        if (tryGet(inner, "lat", lat)) outLat = lat;
-        if (tryGet(inner, "lon", lon)) outLon = lon;
-        if (tryGet(inner, "lng", lon)) outLon = lon;
+    if (!obj["airport"].isNull() && obj["airport"].is<JsonObject>()) {
+        JsonObject inner = obj["airport"].as<JsonObject>();
+        tryGet(inner, "latitude", outLat); tryGet(inner, "longitude", outLon);
+        tryGet(inner, "lat", outLat); tryGet(inner, "lon", outLon); tryGet(inner, "lng", outLon);
     }
 }
 
-// Last good aircraft fix for the current request ident (config tail). Survives
-// API responses with no last_position; intentionally not reset between flight
-// legs for the same tail. Reset in fetchStatus when `ident` changes.
-static String  s_stickyTailKey;
-static double  s_stickyLat  = NAN;
-static double  s_stickyLon  = NAN;
-static int     s_stickyAlt  = 0;
-static unsigned long s_lastTrackFetchMs = 0;
-
-// /track responses are commonly 30+ KB. If AeroAPI /flights omits last_position
-// for several polls in a row, reuse the last track fix and refresh occasionally
-// instead of allocating another large track payload every fetch cycle.
-static const unsigned long kTrackFallbackRefreshMs = 5UL * 60UL * 1000UL;
-
 // ---------------------------------------------------------------------------
-// Public
+// N-number → ICAO24 conversion (US FAA registrations only, no API needed)
 // ---------------------------------------------------------------------------
+//
+// The FAA allocates Mode S addresses 0xA00001–0xAFFFFF for US-registered aircraft.
+// N-numbers map sequentially in the order:
+//   N1, N1A, N1AA, N1AB, …, N1AX, N1B, …, N1XX, N2, N2A, … N99999XX
+// Each numeric group has 601 slots (1 bare + 24 first-letters × 25 sub-slots).
+// Letters used: ABCDEFGHJKLMNPQRSTUVWXYZ (24; I and O excluded).
+//
+// Returns true and writes a 6-char lowercase hex string into outHex[7].
 
-bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
+static const char N_LETTERS[] = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // 24 letters
+
+bool TailTrackerFetcher::nNumberToIcao24(const String &nNumber, char outHex[7])
 {
-    if (strlen(APIConfiguration::AEROAPI_KEY) == 0)
-    {
-        Serial.println("TailTrackerFetcher: No AeroAPI key configured");
-        return false;
-    }
+    const char *s = nNumber.c_str();
+    if (s[0] != 'N' && s[0] != 'n') return false;
+    ++s;
+    if (!isdigit((unsigned char)s[0])) return false;
 
-    if (ident != s_stickyTailKey)
-    {
-        s_stickyTailKey = ident;
-        s_stickyLat     = NAN;
-        s_stickyLon     = NAN;
-        s_stickyAlt     = 0;
-        s_lastTrackFetchMs = 0;
+    uint32_t num = 0;
+    while (*s && isdigit((unsigned char)*s)) {
+        num = num * 10u + (uint32_t)(*s - '0');
+        ++s;
+    }
+    if (num < 1u || num > 99999u) return false;
+
+    int idx1 = -1, idx2 = -1;
+    if (*s) {
+        const char *p = strchr(N_LETTERS, (char)toupper((unsigned char)*s));
+        if (!p) return false;
+        idx1 = (int)(p - N_LETTERS);
+        ++s;
+        if (*s) {
+            const char *p2 = strchr(N_LETTERS, (char)toupper((unsigned char)*s));
+            if (!p2) return false;
+            idx2 = (int)(p2 - N_LETTERS);
+            ++s;
+        }
+    }
+    if (*s) return false; // unexpected trailing chars
+
+    uint32_t offset = 0;
+    if      (idx1 < 0)  offset = 0;
+    else if (idx2 < 0)  offset = 1u + (uint32_t)idx1 * 25u;
+    else                offset = 2u + (uint32_t)idx1 * 25u + (uint32_t)idx2;
+
+    const uint32_t icao = 0xA00001u + (num - 1u) * 601u + offset;
+    snprintf(outHex, 7, "%06x", (unsigned)icao);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// URL-encode a string for a Nominatim query parameter
+// ---------------------------------------------------------------------------
+
+static void appendUrlQueryEncoded(const String &s, String &out)
+{
+    for (size_t i = 0; i < s.length(); ++i) {
+        const unsigned char c = (unsigned char)s[i];
+        if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.') {
+            out += (char)c;
+        } else if (c == ' ') {
+            out += '+';
+        } else {
+            char buf[5];
+            snprintf(buf, sizeof(buf), "%%%02X", (unsigned)c);
+            out += buf;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+
+TailTrackerFetcher::TailTrackerFetcher(OpenSkyFetcher *openSky)
+    : _openSky(openSky) {}
+
+// ---------------------------------------------------------------------------
+// fetchRouteFromAeroAPI — called once per flight leg; caches route metadata
+// ---------------------------------------------------------------------------
+
+bool TailTrackerFetcher::fetchRouteFromAeroAPI(const String &ident)
+{
+    if (strlen(APIConfiguration::AEROAPI_KEY) == 0) {
+        Serial.println(F("TailTrackerFetcher: No AeroAPI key configured"));
+        return false;
     }
 
     const String url = String(APIConfiguration::AEROAPI_BASE_URL) + "/flights/" + ident;
-    bool   https = true;
+    bool https = true;
     String host;
     uint16_t port = 443;
     String path;
-    if (!parseUrl(url, https, host, port, path))
-    {
-        Serial.println("TailTrackerFetcher: Failed to parse AeroAPI URL");
+    if (!parseUrl(url, https, host, port, path)) {
+        Serial.println(F("TailTrackerFetcher: Failed to parse AeroAPI URL"));
         return false;
     }
-
 #if defined(FLIGHTWALL_SKIP_TLS)
-    https = false;
-    port  = 80;
-    Serial.println("TailTrackerFetcher: SKIP_TLS — forcing HTTP on port 80");
+    https = false; port = 80;
 #else
-    if (!https)
-    {
-        Serial.println("TailTrackerFetcher: Refusing non-HTTPS AeroAPI URL");
-        return false;
-    }
+    if (!https) { Serial.println(F("TailTrackerFetcher: Refusing non-HTTPS URL")); return false; }
 #endif
 
     int    code = -1;
@@ -334,32 +260,21 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     {
         const String hdrs = String("x-apikey: ") + APIConfiguration::AEROAPI_KEY
                           + "\r\nAccept: application/json\r\n";
-        if (!wifiClientRequest("GET", host, port, path, hdrs, "", code, payload))
-        {
-            Serial.println("TailTrackerFetcher: AeroAPI request failed");
+        if (!wifiClientRequest("GET", host, port, path, hdrs, "", code, payload)) {
+            Serial.println(F("TailTrackerFetcher: AeroAPI request failed"));
             return false;
         }
     }
 #endif
 
-    if (code != 200)
-    {
-        Serial.print("TailTrackerFetcher: AeroAPI HTTP ");
+    if (code != 200) {
+        Serial.print(F("TailTrackerFetcher: AeroAPI HTTP "));
         Serial.println(code);
         flightwallStringDrop(payload);
         return false;
     }
 
-    // Parsed /flights document can be 10–30 KB.  GetLastTrack and Nominatim each
-    // add another large buffer — keep those requests out of the same live range
-    // as `doc` so the heap is not left ~30 KB below the pre-fetch watermark.
-    TailFlightStatus result;
-    String           faIdForTrack;
-
-    // Build a filter so ArduinoJson only allocates the handful of fields we
-    // actually use from flights[0].  The full response can be 15+ flights with
-    // ~50 fields each; the filter cuts parse time and RAM use dramatically.
-    {
+    // Filter to only the fields we need; reduces parse time and RAM.
     JsonDocument filter;
     filter["flights"][0]["fa_flight_id"]     = true;
     filter["flights"][0]["ident"]            = true;
@@ -368,19 +283,15 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     filter["flights"][0]["actual_off"]       = true;
     filter["flights"][0]["actual_on"]        = true;
     filter["flights"][0]["scheduled_off"]    = true;
-    filter["flights"][0]["scheduled_on"]     = true;
-    filter["flights"][0]["last_position"]["latitude"]  = true;
-    filter["flights"][0]["last_position"]["longitude"] = true;
-    filter["flights"][0]["last_position"]["altitude"]  = true;
-    filter["flights"][0]["origin"]["city"]              = true;
-    filter["flights"][0]["origin"]["name"]              = true;
-    filter["flights"][0]["origin"]["state"]             = true;
-    filter["flights"][0]["origin"]["country_code"]      = true;
-    filter["flights"][0]["origin"]["latitude"]          = true;
-    filter["flights"][0]["origin"]["longitude"]         = true;
-    filter["flights"][0]["origin"]["code_iata"]         = true;
-    filter["flights"][0]["origin"]["code_icao"]         = true;
-    filter["flights"][0]["origin"]["code_lid"]          = true;
+    filter["flights"][0]["origin"]["city"]         = true;
+    filter["flights"][0]["origin"]["name"]         = true;
+    filter["flights"][0]["origin"]["state"]        = true;
+    filter["flights"][0]["origin"]["country_code"] = true;
+    filter["flights"][0]["origin"]["latitude"]     = true;
+    filter["flights"][0]["origin"]["longitude"]    = true;
+    filter["flights"][0]["origin"]["code_iata"]    = true;
+    filter["flights"][0]["origin"]["code_icao"]    = true;
+    filter["flights"][0]["origin"]["code_lid"]     = true;
     filter["flights"][0]["destination"]["city"]         = true;
     filter["flights"][0]["destination"]["name"]         = true;
     filter["flights"][0]["destination"]["code_iata"]    = true;
@@ -395,454 +306,352 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     DeserializationError err = deserializeJson(doc, payload,
                                                DeserializationOption::Filter(filter));
     flightwallStringDrop(payload);
-    if (err)
-    {
-        Serial.print("TailTrackerFetcher: JSON parse error: ");
+    if (err) {
+        Serial.print(F("TailTrackerFetcher: JSON parse error: "));
         Serial.println(err.c_str());
         return false;
     }
 
     JsonArray flights = doc["flights"].as<JsonArray>();
-    if (flights.isNull() || flights.size() == 0)
-    {
-        Serial.println("TailTrackerFetcher: No flights in response");
+    if (flights.isNull() || flights.size() == 0) {
+        Serial.println(F("TailTrackerFetcher: No flights in response"));
         return false;
     }
 
-    // Current epoch needed to rank upcoming scheduled legs.
+    // Current epoch for leg selection.
 #if !defined(ARDUINO_ARCH_ESP32)
     unsigned long nowEpoch = (unsigned long)WiFi.getTime();
 #else
     unsigned long nowEpoch = (unsigned long)time(nullptr);
 #endif
 
-    // Pass 1: prefer the leg that is currently airborne (departed, not yet landed).
-    bool foundAirborne = false;
+    // Pass 1: prefer the leg currently airborne (actual_off set, actual_on not set).
     int  bestIdx       = 0;
-    for (size_t i = 0; i < flights.size(); ++i)
-    {
-        // actual_off non-null  →  wheels have left the ground
-        // actual_on  null      →  not yet landed
-        if (!flights[i]["actual_off"].isNull() && flights[i]["actual_on"].isNull())
-        {
-            bestIdx      = (int)i;
-            foundAirborne = true;
-            break;
+    bool foundAirborne = false;
+    for (size_t i = 0; i < flights.size(); ++i) {
+        if (!flights[i]["actual_off"].isNull() && flights[i]["actual_on"].isNull()) {
+            bestIdx = (int)i; foundAirborne = true; break;
         }
     }
 
-    // Pass 2: no airborne leg (Pass 1) — still need a best row when actual_off
-    // is missing from the API (common briefly after takeoff).
-    //
-    // (A) Prefer a not-yet-landed leg whose scheduled *departure* is already in
-    //     the past and after the most recent actual arrival in the list.  That
-    //     is the "current" segment (en route or API lag) without relying on
-    //     "closest schedule to now" which can wrongly favour an old *landed* row
-    //     or a *future* next-day row in edge cases.
-    // (B) Otherwise pick the leg whose scheduled window is closest to now over
-    //     *all* rows including completed.  That restores "just landed" when the
-    //     next leg is only scheduled in the future — unlike ranking *only*
-    //     incomplete rows, which always hid the most recent arrival.
-    if (!foundAirborne)
-    {
+    // Pass 2: no airborne leg found — pick the most recently-departed un-landed leg
+    // that departs after the last known landing, or fall back to closest-to-now.
+    if (!foundAirborne) {
         unsigned long lastLandEpoch = 0;
-        for (size_t i = 0; i < flights.size(); ++i)
-        {
+        for (size_t i = 0; i < flights.size(); ++i) {
             const String onStr = safeStr(flights[i], "actual_on");
-            if (onStr.length() == 0)
-                continue;
+            if (onStr.length() == 0) continue;
             const unsigned long t = parseISO8601(onStr);
-            if (t > lastLandEpoch)
-                lastLandEpoch = t;
+            if (t > lastLandEpoch) lastLandEpoch = t;
         }
 
-        int            bestAfterLand = -1;
-        unsigned long  bestDepSo     = 0;
-        for (size_t i = 0; i < flights.size(); ++i)
-        {
-            if (!flights[i]["actual_on"].isNull())
-                continue;
-
+        int           bestAfterLand = -1;
+        unsigned long bestDepSo     = 0;
+        for (size_t i = 0; i < flights.size(); ++i) {
+            if (!flights[i]["actual_on"].isNull()) continue;
             const String soStr = safeStr(flights[i], "scheduled_off");
-            if (soStr.length() == 0)
-                continue;
+            if (soStr.length() == 0) continue;
             const unsigned long soEp = parseISO8601(soStr);
-            if (soEp == 0)
-                continue;
-            if (nowEpoch > 0 && soEp >= nowEpoch)
-                continue; // departure not in the past — next flight, not "current"
-            if (soEp <= lastLandEpoch)
-                continue; // not the segment that follows the last known landing
-            if (soEp > bestDepSo)
-            {
-                bestDepSo     = soEp;
-                bestAfterLand = (int)i;
-            }
+            if (soEp == 0) continue;
+            if (nowEpoch > 0 && soEp >= nowEpoch) continue;
+            if (soEp <= lastLandEpoch) continue;
+            if (soEp > bestDepSo) { bestDepSo = soEp; bestAfterLand = (int)i; }
         }
 
-        if (bestAfterLand >= 0)
-        {
+        if (bestAfterLand >= 0) {
             bestIdx = bestAfterLand;
-        }
-        else
-        {
+        } else {
             unsigned long bestDiff = ULONG_MAX;
-            for (size_t i = 0; i < flights.size(); ++i)
-            {
+            for (size_t i = 0; i < flights.size(); ++i) {
                 unsigned long minDiff = ULONG_MAX;
-
-                const String scheduledOff = safeStr(flights[i], "scheduled_off");
-                if (scheduledOff.length() > 0)
-                {
-                    const unsigned long offEpoch = parseISO8601(scheduledOff);
-                    if (offEpoch > 0)
-                    {
-                        const unsigned long d = offEpoch > nowEpoch
-                                                ? offEpoch - nowEpoch
-                                                : nowEpoch - offEpoch;
-                        if (d < minDiff)
-                            minDiff = d;
-                    }
-                }
-
-                const String scheduledOn = safeStr(flights[i], "scheduled_on");
-                if (scheduledOn.length() > 0)
-                {
-                    const unsigned long onEpoch = parseISO8601(scheduledOn);
-                    if (onEpoch > 0)
-                    {
-                        const unsigned long d = onEpoch > nowEpoch
-                                                ? onEpoch - nowEpoch
-                                                : nowEpoch - onEpoch;
-                        if (d < minDiff)
-                            minDiff = d;
-                    }
-                }
-
-                if (minDiff < bestDiff)
-                {
-                    bestDiff = minDiff;
-                    bestIdx  = (int)i;
-                }
+                auto tryTs = [&](const char *key) {
+                    const String ts = safeStr(flights[i], key);
+                    if (ts.length() == 0) return;
+                    const unsigned long ep = parseISO8601(ts);
+                    if (ep == 0) return;
+                    const unsigned long d = ep > nowEpoch ? ep - nowEpoch : nowEpoch - ep;
+                    if (d < minDiff) minDiff = d;
+                };
+                tryTs("scheduled_off");
+                tryTs("scheduled_on");
+                if (minDiff < bestDiff) { bestDiff = minDiff; bestIdx = (int)i; }
             }
         }
     }
 
-    Serial.print("TailTrackerFetcher: using flights[");
+    Serial.print(F("TailTrackerFetcher: using flights["));
     Serial.print(bestIdx);
-    Serial.println("]");
+    Serial.println(F("] (AeroAPI route fetch)"));
 
     JsonObject f = flights[bestIdx].as<JsonObject>();
 
-    result.ident  = safeStr(f, "ident");
-    result.status = safeStr(f, "status");
+    // Cache extracted data.
+    s_cachedIdent  = safeStr(f, "ident");
+    s_cachedStatus = safeStr(f, "status");
+    if (s_cachedStatus == "Arrived")                  s_cachedStatus = "Landed";
+    if (s_cachedStatus.startsWith("En Route"))        s_cachedStatus = "Flying";
+    if (s_cachedStatus.startsWith("Arriving"))        s_cachedStatus = "Arriving";
 
-    // Normalise status variants returned by different AeroAPI versions.
-    if (result.status == "Arrived")               result.status = "Landed";
-    if (result.status.startsWith("En Route"))     result.status = "Flying";
-    if (result.status.startsWith("Arriving"))     result.status = "Arriving";
+    {
+        const String offStr    = safeStr(f, "actual_off");
+        const String onStr     = safeStr(f, "actual_on");
+        const String schOffStr = safeStr(f, "scheduled_off");
+        s_cachedActualOff    = offStr.length()    > 0 ? parseISO8601(offStr)    : 0;
+        s_cachedActualOn     = onStr.length()     > 0 ? parseISO8601(onStr)     : 0;
+        s_cachedScheduledOff = schOffStr.length() > 0 ? parseISO8601(schOffStr) : 0;
+    }
+    if (s_cachedActualOn > 0) s_cachedStatus = "Landed";
 
+    s_cachedOriginCode = "";
+    s_cachedDestCode   = "";
+    s_cachedOriginLat  = NAN; s_cachedOriginLon = NAN;
+    s_cachedDestLat    = NAN; s_cachedDestLon   = NAN;
+    s_cachedOriginCity = ""; s_cachedOriginRegion = "";
+    s_cachedDestCity   = ""; s_cachedDestRegion   = "";
+
+    if (!f["origin"].isNull()) {
+        JsonObject o = f["origin"].as<JsonObject>();
+        if (!o["code_iata"].isNull())      s_cachedOriginCode = o["code_iata"].as<const char *>();
+        else if (!o["code_lid"].isNull())  s_cachedOriginCode = o["code_lid"].as<const char *>();
+        else if (!o["code_icao"].isNull()) s_cachedOriginCode = o["code_icao"].as<const char *>();
+        extractAirportLatLon(o, s_cachedOriginLat, s_cachedOriginLon);
+
+        if (!o["city"].isNull())        s_cachedOriginCity = o["city"].as<const char *>();
+        else if (!o["name"].isNull())   s_cachedOriginCity = o["name"].as<const char *>();
+        if (!o["state"].isNull()) {
+            const char *abbr = usStateAbbrev(o["state"].as<const char *>());
+            s_cachedOriginRegion = abbr ? String(abbr) : safeStr(o, "state");
+        } else if (!o["country_code"].isNull()) {
+            s_cachedOriginRegion = o["country_code"].as<const char *>();
+            s_cachedOriginRegion.toUpperCase();
+        }
+    }
+
+    if (!f["destination"].isNull()) {
+        JsonObject d = f["destination"].as<JsonObject>();
+        if (!d["code_iata"].isNull())      s_cachedDestCode = d["code_iata"].as<const char *>();
+        else if (!d["code_lid"].isNull())  s_cachedDestCode = d["code_lid"].as<const char *>();
+        else if (!d["code_icao"].isNull()) s_cachedDestCode = d["code_icao"].as<const char *>();
+        extractAirportLatLon(d, s_cachedDestLat, s_cachedDestLon);
+
+        if (!d["city"].isNull())        s_cachedDestCity = d["city"].as<const char *>();
+        else if (!d["name"].isNull())   s_cachedDestCity = d["name"].as<const char *>();
+        if (!d["state"].isNull()) {
+            const char *abbr = usStateAbbrev(d["state"].as<const char *>());
+            s_cachedDestRegion = abbr ? String(abbr) : safeStr(d, "state");
+        } else if (!d["country_code"].isNull()) {
+            s_cachedDestRegion = d["country_code"].as<const char *>();
+            s_cachedDestRegion.toUpperCase();
+        }
+    }
+
+    s_cachedFetchEpoch  = nowEpoch;
+    s_cachedFetchMillis = millis();
+    s_routeValid        = true;
+
+    Serial.print(F("TailTrackerFetcher: route cached origin="));
+    Serial.print(s_cachedOriginCode);
+    Serial.print(F(" dest="));
+    Serial.print(s_cachedDestCode);
+    Serial.print(F(" status="));
+    Serial.println(s_cachedStatus);
+
+    // If airport lat/lon missing, forward-geocode from city/code so progress
+    // computation has real coordinates.
+    if (!hasPlausibleLatLon(s_cachedOriginLat, s_cachedOriginLon)) {
+        String q = s_cachedOriginCity.length() ? s_cachedOriginCity : s_cachedOriginCode;
+        if (s_cachedOriginCity.length() && s_cachedOriginRegion.length())
+            q += ", " + s_cachedOriginRegion;
+        double la, lo;
+        if (q.length() && fetchForwardGeocodeForDestination(q, la, lo)) {
+            s_cachedOriginLat = la; s_cachedOriginLon = lo;
+        }
+    }
+    if (!hasPlausibleLatLon(s_cachedDestLat, s_cachedDestLon)) {
+        String q = s_cachedDestCity.length() ? s_cachedDestCity : s_cachedDestCode;
+        if (s_cachedDestCity.length() && s_cachedDestRegion.length())
+            q += ", " + s_cachedDestRegion;
+        double la, lo;
+        if (q.length() && fetchForwardGeocodeForDestination(q, la, lo)) {
+            s_cachedDestLat = la; s_cachedDestLon = lo;
+        }
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// fetchStatus — main public entry point
+// ---------------------------------------------------------------------------
+
+bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
+{
+    const unsigned long nowMs = millis();
+
+    // --- Reset when the tracked ident changes ---
+    if (ident != s_trackedIdent) {
+        s_trackedIdent      = ident;
+        s_routeValid        = false;
+        s_routeNeedsRefresh = true;
+        s_routeFetchMs      = 0;
+        s_cachedIcao24      = "";
+        s_stickyLat         = NAN;
+        s_stickyLon         = NAN;
+        s_stickyAlt         = 0;
+        s_wasAirborne       = false;
+        Serial.print(F("TailTracker: tracking new ident "));
+        Serial.println(ident);
+    }
+
+    // --- Compute ICAO24 from N-number (US aircraft; instant, no API call) ---
+    if (s_cachedIcao24.length() == 0) {
+        char hex[7];
+        if (nNumberToIcao24(ident, hex)) {
+            s_cachedIcao24 = String(hex);
+            Serial.print(F("TailTracker: ICAO24="));
+            Serial.println(s_cachedIcao24);
+        }
+    }
+
+    // --- Refresh route from AeroAPI if needed ---
+    const bool routeExpired  = (s_routeFetchMs == 0 ||
+                                nowMs - s_routeFetchMs >= ROUTE_REFRESH_INTERVAL_MS);
+    const bool needsRefresh  = !s_routeValid || s_routeNeedsRefresh || routeExpired;
+
+    if (needsRefresh) {
+        Serial.println(F("TailTracker: fetching route from AeroAPI"));
+        if (!fetchRouteFromAeroAPI(ident)) {
+            if (!s_routeValid) {
+                Serial.println(F("TailTracker: No cached route, cannot display"));
+                return false;
+            }
+            Serial.println(F("TailTracker: AeroAPI failed — using cached route"));
+        } else {
+            s_routeFetchMs      = nowMs;
+            s_routeNeedsRefresh = false;
+        }
+    }
+
+    // --- Build result from cached route ---
+    TailFlightStatus result;
+    result.ident            = s_cachedIdent;
+    result.status           = s_cachedStatus;
+    result.origin_code      = s_cachedOriginCode;
+    result.dest_code        = s_cachedDestCode;
+    result.origin_lat       = s_cachedOriginLat;
+    result.origin_lon       = s_cachedOriginLon;
+    result.dest_lat         = s_cachedDestLat;
+    result.dest_lon         = s_cachedDestLon;
+    result.actual_off_epoch    = s_cachedActualOff;
+    result.actual_on_epoch     = s_cachedActualOn;
+    result.scheduled_off_epoch = s_cachedScheduledOff;
+    result.fetch_epoch      = s_cachedFetchEpoch;
+    result.fetch_millis     = s_cachedFetchMillis;
     result.progress_percent = 0;
-    if (!f["progress_percent"].isNull())
-        result.progress_percent = f["progress_percent"].as<int>();
 
-    String offStr = safeStr(f, "actual_off");
-    String onStr  = safeStr(f, "actual_on");
-    String schOffStr = safeStr(f, "scheduled_off");
-    result.actual_off_epoch    = offStr.length()    > 0 ? parseISO8601(offStr)    : 0;
-    result.actual_on_epoch     = onStr.length()     > 0 ? parseISO8601(onStr)     : 0;
-    result.scheduled_off_epoch = schOffStr.length() > 0 ? parseISO8601(schOffStr) : 0;
+    // --- Try OpenSky for current position ---
+    bool gotPosition = false;
 
-    // AeroAPI omits progress_percent once the flight has landed; treat as 100.
+    if (s_cachedIcao24.length() > 0 && _openSky != nullptr) {
+        StateVector sv;
+        if (_openSky->fetchByIcao24(s_cachedIcao24, sv)
+                && hasPlausibleLatLon(sv.lat, sv.lon)) {
+
+            result.lat         = sv.lat;
+            result.lon         = sv.lon;
+            result.altitude_ft = isnan(sv.baro_altitude) ? 0
+                               : (int)(sv.baro_altitude * 3.28084f);
+            gotPosition = true;
+
+            // Compute geometric progress from cached origin/dest coordinates.
+            if (hasPlausibleLatLon(s_cachedOriginLat, s_cachedOriginLon) &&
+                hasPlausibleLatLon(s_cachedDestLat,   s_cachedDestLon))
+            {
+                const double total = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
+                                                 s_cachedDestLat,   s_cachedDestLon);
+                if (total > 10.0) {
+                    const double traveled = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
+                                                        sv.lat, sv.lon);
+                    int prog = (int)lround((traveled * 100.0) / total);
+                    if (prog < 0)   prog = 0;
+                    if (prog > 100) prog = 100;
+                    result.progress_percent = prog;
+                }
+            }
+
+            // Infer flight status from on_ground flag and airborne history.
+            const bool wasAirborne = s_wasAirborne;
+            if (!sv.on_ground) {
+                result.status    = "Flying";
+                s_wasAirborne    = true;
+                result.actual_on_epoch = 0; // not yet landed
+            } else {
+                if (wasAirborne) {
+                    // Transition: just landed → fetch next leg from AeroAPI.
+                    result.status       = "Landed";
+                    s_wasAirborne       = false;
+                    s_routeNeedsRefresh = true;
+                    Serial.println(F("TailTracker: landing detected via OpenSky"));
+                } else {
+                    result.status = (s_cachedActualOn > 0) ? "Landed" : "On Ground";
+                }
+            }
+            if (result.progress_percent == 100 && sv.on_ground)
+                result.status = "Landed";
+
+            // Update sticky position.
+            s_stickyLat = sv.lat;
+            s_stickyLon = sv.lon;
+            s_stickyAlt = result.altitude_ft;
+
+            // Reverse-geocode current location.
+            fetchReverseGeocode(sv.lat, sv.lon, result.city, result.region);
+
+        } else {
+            Serial.print(F("TailTracker: not found on OpenSky (icao24="));
+            Serial.print(s_cachedIcao24);
+            Serial.println(')');
+        }
+    } else if (s_cachedIcao24.length() == 0) {
+        Serial.println(F("TailTracker: ICAO24 unknown — OpenSky position unavailable"));
+    }
+
+    // --- Fall back to sticky position when OpenSky had no data ---
+    if (!gotPosition) {
+        if (hasPlausibleLatLon(s_stickyLat, s_stickyLon)) {
+            result.lat         = s_stickyLat;
+            result.lon         = s_stickyLon;
+            result.altitude_ft = s_stickyAlt;
+
+            if (hasPlausibleLatLon(s_cachedOriginLat, s_cachedOriginLon) &&
+                hasPlausibleLatLon(s_cachedDestLat,   s_cachedDestLon))
+            {
+                const double total = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
+                                                 s_cachedDestLat,   s_cachedDestLon);
+                if (total > 10.0) {
+                    const double traveled = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
+                                                        s_stickyLat, s_stickyLon);
+                    int prog = (int)lround((traveled * 100.0) / total);
+                    if (prog < 0)   prog = 0;
+                    if (prog > 100) prog = 100;
+                    result.progress_percent = prog;
+                }
+            }
+        }
+
+        // Use city/region from cached AeroAPI data.
+        if (result.actual_on_epoch > 0) {
+            result.city   = s_cachedDestCity;
+            result.region = s_cachedDestRegion;
+        } else if (result.actual_off_epoch == 0) {
+            result.city   = s_cachedOriginCity;
+            result.region = s_cachedOriginRegion;
+        }
+    }
+
+    // AeroAPI lands set progress to 100.
     if (result.actual_on_epoch > 0 && result.progress_percent == 0)
         result.progress_percent = 100;
-
-    // Best available destination airport code: IATA (3-letter) preferred,
-    // then local ID (3-letter for most US airports), then ICAO (4-letter).
-    if (!f["destination"].isNull())
-    {
-        JsonObject dest = f["destination"].as<JsonObject>();
-        if (!dest["code_iata"].isNull())
-            result.dest_code = dest["code_iata"].as<const char *>();
-        else if (!dest["code_lid"].isNull())
-            result.dest_code = dest["code_lid"].as<const char *>();
-        else if (!dest["code_icao"].isNull())
-            result.dest_code = dest["code_icao"].as<const char *>();
-        extractAirportLatLon(dest, result.dest_lat, result.dest_lon);
-    }
-
-    if (!f["origin"].isNull())
-    {
-        JsonObject orig = f["origin"].as<JsonObject>();
-        extractAirportLatLon(orig, result.origin_lat, result.origin_lon);
-
-        // Best available origin airport code: IATA preferred, then LID, then ICAO.
-        if (!orig["code_iata"].isNull())
-            result.origin_code = orig["code_iata"].as<const char *>();
-        else if (!orig["code_lid"].isNull())
-            result.origin_code = orig["code_lid"].as<const char *>();
-        else if (!orig["code_icao"].isNull())
-            result.origin_code = orig["code_icao"].as<const char *>();
-    }
-
-    // Scheduled / on-ground: AeroAPI often omits airport lat/lon in the /flights
-    // payload. Use the same Nominatim forward-geocode approach as the landed fix
-    // so the compass has a real bearing instead of defaulting to north.
-
-    result.lat = NAN;
-    result.lon = NAN;
-    result.altitude_ft = 0;
-    if (!f["last_position"].isNull())
-    {
-        JsonObject pos = f["last_position"].as<JsonObject>();
-        if (!pos["latitude"].isNull())  result.lat          = pos["latitude"].as<double>();
-        if (!pos["longitude"].isNull()) result.lon          = pos["longitude"].as<double>();
-        if (!pos["altitude"].isNull())  result.altitude_ft  = pos["altitude"].as<int>();
-    }
-    Serial.print("TailTrackerFetcher: lat=");
-    Serial.print(isnan(result.lat) ? 0.0 : result.lat, 4);
-    Serial.print(" lon=");
-    Serial.print(isnan(result.lon) ? 0.0 : result.lon, 4);
-    Serial.print(" alt=");
-    Serial.println(result.altitude_ft);
-
-    // Capture a time reference so the display can compute elapsed time without
-    // hitting WiFi.getTime() on every frame.
-#if !defined(ARDUINO_ARCH_ESP32)
-    result.fetch_epoch = (unsigned long)WiFi.getTime();
-#else
-    result.fetch_epoch = (unsigned long)time(nullptr);
-#endif
-    result.fetch_millis = millis();
-
-    // City/region from JSON only, while `f` and JsonDocument are still valid
-    // (GetLastTrack + Nominatim must not run in the same scope as /flights doc).
-    {
-        const bool hasLivePos = hasPlausibleAircraftPosition(result.lat, result.lon);
-
-        if (!hasLivePos && result.actual_on_epoch > 0)
-        {
-            Serial.println("TailTrackerFetcher: landed, no position — using destination");
-            if (!f["destination"].isNull())
-            {
-                JsonObject dest = f["destination"].as<JsonObject>();
-                if (!dest["city"].isNull())
-                    result.city = dest["city"].as<const char *>();
-                else if (!dest["name"].isNull())
-                    result.city = dest["name"].as<const char *>();
-                else if (!dest["code_icao"].isNull())
-                    result.city = dest["code_icao"].as<const char *>();
-
-                if (!dest["state"].isNull())
-                {
-                    const char *abbr = usStateAbbrev(dest["state"].as<const char *>());
-                    result.region = abbr ? String(abbr) : safeStr(dest, "state");
-                }
-                else if (!dest["country_code"].isNull())
-                {
-                    result.region = String(dest["country_code"].as<const char *>());
-                    result.region.toUpperCase();
-                }
-
-                Serial.print("TailTrackerFetcher: dest city=");
-                Serial.print(result.city);
-                Serial.print(" region=");
-                Serial.println(result.region);
-            }
-            else
-            {
-                Serial.println("TailTrackerFetcher: destination is null");
-            }
-        }
-        else if (!hasLivePos && result.actual_off_epoch == 0
-                 && !f["origin"].isNull())
-        {
-            JsonObject orig = f["origin"].as<JsonObject>();
-            Serial.println("TailTrackerFetcher: on ground, using origin location");
-
-            if (!orig["city"].isNull())
-                result.city = orig["city"].as<const char *>();
-            else if (!orig["name"].isNull())
-                result.city = orig["name"].as<const char *>();
-
-            if (!orig["state"].isNull())
-            {
-                const char *abbr = usStateAbbrev(orig["state"].as<const char *>());
-                result.region = abbr ? String(abbr) : safeStr(orig, "state");
-            }
-            else if (!orig["country_code"].isNull())
-            {
-                result.region = String(orig["country_code"].as<const char *>());
-                result.region.toUpperCase();
-            }
-
-            Serial.print("TailTrackerFetcher: origin city=");
-            Serial.print(result.city);
-            Serial.print(" region=");
-            Serial.println(result.region);
-        }
-    }
-
-    faIdForTrack = safeStr(f, "fa_flight_id");
-    } // end scope: free filter + doc before /track or Nominatim (heap watermark)
-
-    // Location resolution (network) — /flights JsonDocument is gone.
-    if (hasPlausibleAircraftPosition(result.lat, result.lon))
-    {
-        Serial.print("TailTrackerFetcher: geocoding lat=");
-        Serial.print(result.lat, 4);
-        Serial.print(" lon=");
-        Serial.println(result.lon, 4);
-        fetchReverseGeocode(result.lat, result.lon, result.city, result.region);
-    }
-    else if (result.actual_on_epoch > 0)
-    {
-        // city/region from destination in JSON, set above
-    }
-    else
-    {
-        if (result.actual_off_epoch == 0)
-        {
-            // on ground: city/region from origin in JSON, set above (if any)
-        }
-        else if (faIdForTrack.length() > 0)
-        {
-            const unsigned long trackAgeMs =
-                (s_lastTrackFetchMs == 0) ? ULONG_MAX : (millis() - s_lastTrackFetchMs);
-            if (hasPlausibleAircraftPosition(s_stickyLat, s_stickyLon)
-                && trackAgeMs < kTrackFallbackRefreshMs)
-            {
-                result.lat = s_stickyLat;
-                result.lon = s_stickyLon;
-                if (result.altitude_ft == 0 && s_stickyAlt > 0)
-                    result.altitude_ft = s_stickyAlt;
-                Serial.print("TailTrackerFetcher: using cached track lat=");
-                Serial.print(result.lat, 4);
-                Serial.print(" lon=");
-                Serial.print(result.lon, 4);
-                Serial.print(" alt=");
-                Serial.println(result.altitude_ft);
-                fetchReverseGeocode(result.lat, result.lon,
-                                    result.city, result.region);
-            }
-            else
-            {
-                Serial.println("TailTrackerFetcher: airborne, trying GetLastTrack");
-                double trackLat = NAN, trackLon = NAN;
-                int    trackAlt = 0;
-                if (fetchTrackPosition(faIdForTrack, trackLat, trackLon, trackAlt)
-                        && !isnan(trackLat) && !isnan(trackLon))
-                {
-                    s_lastTrackFetchMs = millis();
-                    result.lat         = trackLat;
-                    result.lon         = trackLon;
-                    result.altitude_ft = trackAlt;
-                    Serial.print("TailTrackerFetcher: track lat=");
-                    Serial.print(result.lat, 4);
-                    Serial.print(" lon=");
-                    Serial.print(result.lon, 4);
-                    Serial.print(" alt=");
-                    Serial.println(result.altitude_ft);
-                    fetchReverseGeocode(result.lat, result.lon,
-                                        result.city, result.region);
-                }
-                else
-                {
-                    Serial.println("TailTrackerFetcher: track unavailable");
-                }
-            }
-        }
-        else
-        {
-            Serial.println("TailTrackerFetcher: no fa_flight_id, cannot fetch track");
-        }
-    }
-
-    // Landed: destination airport may omit lat/lon in the AeroAPI payload; the
-    // line-3 text is still set from the destination city/region. Forward-geocode
-    // that (or the dest code) so dest_lat/dest_lon feed the compass fallback.
-    if (result.actual_on_epoch > 0
-        && (isnan(result.dest_lat) || isnan(result.dest_lon)))
-    {
-        String gq;
-        if (result.city.length() > 0)
-        {
-            gq = result.city;
-            if (result.region.length() > 0)
-            {
-                gq += ", ";
-                gq += result.region;
-            }
-        }
-        else if (result.dest_code.length() > 0)
-        {
-            gq = result.dest_code;
-        }
-        if (gq.length() > 0)
-        {
-            double fla, flo;
-            if (fetchForwardGeocodeForDestination(gq, fla, flo)
-                    && hasPlausibleAircraftPosition(fla, flo))
-            {
-                result.dest_lat = fla;
-                result.dest_lon = flo;
-                Serial.print("TailTrackerFetcher: forward geocode dest ");
-                Serial.print(fla, 4);
-                Serial.print(",");
-                Serial.println(flo, 4);
-            }
-        }
-    }
-
-    // On-ground / scheduled: forward-geocode the origin location (line-3 text)
-    // so origin_lat/origin_lon feed the compass fallback.
-    if (result.actual_off_epoch == 0 && result.actual_on_epoch == 0
-        && (isnan(result.origin_lat) || isnan(result.origin_lon)))
-    {
-        String gq;
-        if (result.city.length() > 0)
-        {
-            gq = result.city;
-            if (result.region.length() > 0)
-            {
-                gq += ", ";
-                gq += result.region;
-            }
-        }
-        else if (result.origin_code.length() > 0)
-        {
-            gq = result.origin_code;
-        }
-
-        if (gq.length() > 0)
-        {
-            double ola, olo;
-            if (fetchForwardGeocodeForDestination(gq, ola, olo)
-                    && hasPlausibleAircraftPosition(ola, olo))
-            {
-                result.origin_lat = ola;
-                result.origin_lon = olo;
-                Serial.print("TailTrackerFetcher: forward geocode origin ");
-                Serial.print(ola, 4);
-                Serial.print(",");
-                Serial.println(olo, 4);
-            }
-        }
-    }
-
-    if (hasPlausibleAircraftPosition(result.lat, result.lon))
-    {
-        s_stickyLat = result.lat;
-        s_stickyLon = result.lon;
-        s_stickyAlt = result.altitude_ft;
-    }
-    else if (hasPlausibleAircraftPosition(s_stickyLat, s_stickyLon))
-    {
-        result.lat = s_stickyLat;
-        result.lon = s_stickyLon;
-        if (result.altitude_ft == 0 && s_stickyAlt > 0)
-            result.altitude_ft = s_stickyAlt;
-    }
 
     result.valid = true;
     out = result;
@@ -850,169 +659,7 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
 }
 
 // ---------------------------------------------------------------------------
-// GetLastTrack — fallback position when last_position is absent
-// ---------------------------------------------------------------------------
-
-bool TailTrackerFetcher::fetchTrackPosition(const String &faFlightId,
-                                             double &outLat, double &outLon,
-                                             int &outAlt)
-{
-    if (strlen(APIConfiguration::AEROAPI_KEY) == 0) return false;
-
-    const String url = String(APIConfiguration::AEROAPI_BASE_URL)
-                     + "/flights/" + faFlightId + "/track";
-    bool   https = true;
-    String host;
-    uint16_t port = 443;
-    String path;
-    if (!parseUrl(url, https, host, port, path)) return false;
-
-#if defined(FLIGHTWALL_SKIP_TLS)
-    https = false;
-    port  = 80;
-#endif
-
-    int    code = -1;
-    String payload;
-
-#if defined(ARDUINO_ARCH_ESP32)
-    {
-        TailTlsClient net;
-#if !defined(FLIGHTWALL_SKIP_TLS)
-        if (APIConfiguration::AEROAPI_INSECURE_TLS) net.setInsecure();
-#endif
-        HttpClient http(net, host.c_str(), port);
-        http.setHttpResponseTimeout(30000);
-        http.beginRequest();
-        http.get(path);
-        http.sendHeader("x-apikey", APIConfiguration::AEROAPI_KEY);
-        http.sendHeader("Accept",   "application/json");
-        http.endRequest();
-        code    = http.responseStatusCode();
-        payload = http.responseBody();
-    }
-#else
-    {
-        const String hdrs = String("x-apikey: ") + APIConfiguration::AEROAPI_KEY
-                          + "\r\nAccept: application/json\r\n";
-        TrackStreamParser parser;
-        if (!wifiClientRequestStream("GET", host, port, path, hdrs, "", code,
-                                     trackStreamOnChunk, &parser))
-        {
-            Serial.println("TailTrackerFetcher: track request failed");
-            return false;
-        }
-        if (parser.pendingKey != nullptr && parser.readingValue)
-            trackParserCommitValue(parser);
-        if (code != 200)
-        {
-            Serial.print("TailTrackerFetcher: track HTTP ");
-            Serial.println(code);
-            return false;
-        }
-        if (!hasPlausibleAircraftPosition(parser.lastLat, parser.lastLon))
-        {
-            Serial.println("TailTrackerFetcher: track positions array empty");
-            return false;
-        }
-        outLat = parser.lastLat;
-        outLon = parser.lastLon;
-        outAlt = parser.lastAlt;
-        return true;
-    }
-#endif
-
-    if (code != 200)
-    {
-        Serial.print("TailTrackerFetcher: track HTTP ");
-        Serial.println(code);
-        flightwallStringDrop(payload);
-        return false;
-    }
-
-    // Filter: keep lat/lon/altitude from every position entry.
-    JsonDocument trackFilter;
-    trackFilter["positions"][0]["latitude"]  = true;
-    trackFilter["positions"][0]["longitude"] = true;
-    trackFilter["positions"][0]["altitude"]  = true;
-
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payload,
-                                               DeserializationOption::Filter(trackFilter));
-    flightwallStringDrop(payload);
-    if (err)
-    {
-        Serial.print("TailTrackerFetcher: track JSON parse error: ");
-        Serial.println(err.c_str());
-        return false;
-    }
-
-    JsonArray positions = doc["positions"].as<JsonArray>();
-    if (positions.isNull() || positions.size() == 0)
-    {
-        Serial.println("TailTrackerFetcher: track positions array empty");
-        doc.clear();
-        return false;
-    }
-
-    // Positions are in ascending time order; the last element is the most recent.
-    // Note: the track endpoint returns altitude in hundreds of feet (flight
-    // levels), e.g. 360 = FL360 = 36,000 ft.  Multiply by 100 to get feet.
-    double lastLat = NAN, lastLon = NAN;
-    int    lastAlt = 0;
-    for (JsonObject pos : positions)
-    {
-        if (!pos["latitude"].isNull() && !pos["longitude"].isNull())
-        {
-            lastLat = pos["latitude"].as<double>();
-            lastLon = pos["longitude"].as<double>();
-            if (!pos["altitude"].isNull())
-                lastAlt = pos["altitude"].as<int>() * 100;
-        }
-    }
-
-    if (isnan(lastLat) || isnan(lastLon))
-    {
-        doc.clear();
-        return false;
-    }
-
-    outLat = lastLat;
-    outLon = lastLon;
-    outAlt = lastAlt;
-    doc.clear();
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// URL-encode a string for a Nominatim query= parameter.
-// ---------------------------------------------------------------------------
-
-static void appendUrlQueryEncoded(const String &s, String &out)
-{
-    for (size_t i = 0; i < s.length(); ++i)
-    {
-        const unsigned char c = (unsigned char)s[i];
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
-            || c == '-' || c == '_' || c == '.')
-        {
-            out += (char)c;
-        }
-        else if (c == ' ')
-        {
-            out += '+';
-        }
-        else
-        {
-            char buf[5];
-            snprintf(buf, sizeof(buf), "%%%02X", (unsigned int)c);
-            out += buf;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Forward geocoding via Nominatim /search (arrival city → lat/lon for compass)
+// Forward geocoding via Nominatim /search
 // ---------------------------------------------------------------------------
 
 bool TailTrackerFetcher::fetchForwardGeocodeForDestination(const String &searchQuery,
@@ -1022,8 +669,7 @@ bool TailTrackerFetcher::fetchForwardGeocodeForDestination(const String &searchQ
         return false;
 
     if (searchQuery == _lastForwardQuery
-        && !isnan(_lastForwardLat) && !isnan(_lastForwardLon))
-    {
+            && !isnan(_lastForwardLat) && !isnan(_lastForwardLon)) {
         outLat = _lastForwardLat;
         outLon = _lastForwardLon;
         return true;
@@ -1031,15 +677,10 @@ bool TailTrackerFetcher::fetchForwardGeocodeForDestination(const String &searchQ
 
     String path = String("/search?format=json&limit=1&q=");
     appendUrlQueryEncoded(searchQuery, path);
-    if (path.length() > 512)
-    {
-        Serial.println("TailTrackerFetcher: forward geocode query too long");
-        return false;
-    }
+    if (path.length() > 512) return false;
 
     const String   host = "nominatim.openstreetmap.org";
     const uint16_t port = 443;
-
     int    code = -1;
     String payload;
 
@@ -1061,60 +702,37 @@ bool TailTrackerFetcher::fetchForwardGeocodeForDestination(const String &searchQ
     }
 #else
     {
-        const String hdrs =
-            "User-Agent: FlightWallFirmware/1.0\r\nAccept: application/json\r\n";
-        if (!wifiClientRequest("GET", host, port, path, hdrs, "", code, payload))
-        {
-            Serial.println("TailTrackerFetcher: Nominatim /search failed");
+        const String hdrs = "User-Agent: FlightWallFirmware/1.0\r\nAccept: application/json\r\n";
+        if (!wifiClientRequest("GET", host, port, path, hdrs, "", code, payload)) {
+            Serial.println(F("TailTrackerFetcher: Nominatim /search failed"));
             return false;
         }
     }
 #endif
 
-    if (code != 200)
-    {
-        Serial.print("TailTrackerFetcher: Nominatim /search HTTP ");
+    if (code != 200) {
+        Serial.print(F("TailTrackerFetcher: Nominatim /search HTTP "));
         Serial.println(code);
         return false;
     }
 
-    // First hit only: keep parse cost and RAM small.
     JsonDocument searchFilter;
     searchFilter[0]["lat"] = true;
     searchFilter[0]["lon"] = true;
-
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload,
-                                             DeserializationOption::Filter(searchFilter));
+                                               DeserializationOption::Filter(searchFilter));
     flightwallStringDrop(payload);
-    if (err)
-    {
-        Serial.println("TailTrackerFetcher: Nominatim /search JSON parse error");
-        return false;
-    }
+    if (err) return false;
 
     JsonArray hits = doc.as<JsonArray>();
-    if (hits.isNull() || hits.size() == 0)
-    {
-        Serial.println("TailTrackerFetcher: Nominatim /search: no results");
-        doc.clear();
-        return false;
-    }
-
+    if (hits.isNull() || hits.size() == 0) { doc.clear(); return false; }
     JsonObject first = hits[0].as<JsonObject>();
-    if (first["lat"].isNull() || first["lon"].isNull())
-    {
-        doc.clear();
-        return false;
-    }
-
+    if (first["lat"].isNull() || first["lon"].isNull()) { doc.clear(); return false; }
     outLat = first["lat"].as<double>();
     outLon = first["lon"].as<double>();
     doc.clear();
-
-    if (isnan(outLat) || isnan(outLon))
-        return false;
-
+    if (isnan(outLat) || isnan(outLon)) return false;
     _lastForwardQuery = searchQuery;
     _lastForwardLat   = outLat;
     _lastForwardLon   = outLon;
@@ -1128,12 +746,9 @@ bool TailTrackerFetcher::fetchForwardGeocodeForDestination(const String &searchQ
 bool TailTrackerFetcher::fetchReverseGeocode(double lat, double lon,
                                               String &outCity, String &outRegion)
 {
-    // Reuse cached result when the aircraft hasn't moved significantly.
-    if (!isnan(_lastGeoLat) && !isnan(_lastGeoLon))
-    {
+    if (!isnan(_lastGeoLat) && !isnan(_lastGeoLon)) {
         if (haversineKm(_lastGeoLat, _lastGeoLon, lat, lon)
-                < TailTrackerConfiguration::GEO_CACHE_THRESHOLD_KM)
-        {
+                < TailTrackerConfiguration::GEO_CACHE_THRESHOLD_KM) {
             outCity   = _lastCity;
             outRegion = _lastRegion;
             return true;
@@ -1142,7 +757,6 @@ bool TailTrackerFetcher::fetchReverseGeocode(double lat, double lon,
 
     const String   host = "nominatim.openstreetmap.org";
     const uint16_t port = 443;
-
     char pathBuf[88];
     snprintf(pathBuf, sizeof(pathBuf),
              "/reverse?format=json&lat=%.4f&lon=%.4f&zoom=10", lat, lon);
@@ -1169,19 +783,16 @@ bool TailTrackerFetcher::fetchReverseGeocode(double lat, double lon,
     }
 #else
     {
-        const String hdrs =
-            "User-Agent: FlightWallFirmware/1.0\r\nAccept: application/json\r\n";
-        if (!wifiClientRequest("GET", host, port, path, hdrs, "", code, payload))
-        {
-            Serial.println("TailTrackerFetcher: Nominatim request failed");
+        const String hdrs = "User-Agent: FlightWallFirmware/1.0\r\nAccept: application/json\r\n";
+        if (!wifiClientRequest("GET", host, port, path, hdrs, "", code, payload)) {
+            Serial.println(F("TailTrackerFetcher: Nominatim reverse failed"));
             return false;
         }
     }
 #endif
 
-    if (code != 200)
-    {
-        Serial.print("TailTrackerFetcher: Nominatim HTTP ");
+    if (code != 200) {
+        Serial.print(F("TailTrackerFetcher: Nominatim reverse HTTP "));
         Serial.println(code);
         return false;
     }
@@ -1189,47 +800,34 @@ bool TailTrackerFetcher::fetchReverseGeocode(double lat, double lon,
     JsonDocument geo;
     DeserializationError err = deserializeJson(geo, payload);
     flightwallStringDrop(payload);
-    if (err)
-    {
-        Serial.println("TailTrackerFetcher: Nominatim JSON parse error");
-        return false;
-    }
+    if (err) return false;
 
     JsonObject addr = geo["address"].as<JsonObject>();
-
-    // City fallback chain: city → town → village → municipality → county.
     String city;
-    if      (!addr["city"].isNull())         city = addr["city"].as<const char *>();
-    else if (!addr["town"].isNull())          city = addr["town"].as<const char *>();
-    else if (!addr["village"].isNull())       city = addr["village"].as<const char *>();
-    else if (!addr["municipality"].isNull())  city = addr["municipality"].as<const char *>();
-    else if (!addr["county"].isNull())        city = addr["county"].as<const char *>();
+    if      (!addr["city"].isNull())        city = addr["city"].as<const char *>();
+    else if (!addr["town"].isNull())         city = addr["town"].as<const char *>();
+    else if (!addr["village"].isNull())      city = addr["village"].as<const char *>();
+    else if (!addr["municipality"].isNull()) city = addr["municipality"].as<const char *>();
+    else if (!addr["county"].isNull())       city = addr["county"].as<const char *>();
 
-    String cc = addr["country_code"].isNull()
-                ? String("") : String(addr["country_code"].as<const char *>());
+    String cc = addr["country_code"].isNull() ? String("")
+              : String(addr["country_code"].as<const char *>());
     cc.toUpperCase();
 
     String region;
-    if (cc == "US")
-    {
-        String state = addr["state"].isNull()
-                       ? String("") : String(addr["state"].as<const char *>());
+    if (cc == "US") {
+        String state = addr["state"].isNull() ? String("")
+                     : String(addr["state"].as<const char *>());
         const char *abbr = usStateAbbrev(state.c_str());
         region = abbr ? String(abbr) : cc;
-    }
-    else
-    {
+    } else {
         region = cc;
     }
 
     outCity   = city;
     outRegion = region;
-
-    _lastGeoLat = lat;
-    _lastGeoLon = lon;
-    _lastCity   = city;
-    _lastRegion = region;
-
+    _lastGeoLat = lat; _lastGeoLon = lon;
+    _lastCity   = city; _lastRegion = region;
     geo.clear();
     return true;
 }
@@ -1259,8 +857,7 @@ const char *TailTrackerFetcher::usStateAbbrev(const char *fullName)
         {"Virginia","VA"},        {"Washington","WA"},       {"West Virginia","WV"},
         {"Wisconsin","WI"},       {"Wyoming","WY"},
     };
-    for (const auto &e : kTable)
-    {
+    for (const auto &e : kTable) {
         if (strcmp(fullName, e.full) == 0) return e.abbr;
     }
     return nullptr;
