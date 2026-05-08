@@ -716,30 +716,11 @@ bool TailTrackerFetcher::fetchTrackPosition(const String &faFlightId,
     {
         const String hdrs = String("x-apikey: ") + APIConfiguration::AEROAPI_KEY
                           + "\r\nAccept: application/json\r\n";
-        TrackStreamParser parser;
-        if (!wifiClientRequestStream("GET", host, port, path, hdrs, "", code,
-                                     trackStreamOnChunk, &parser))
+        if (!wifiClientRequest("GET", host, port, path, hdrs, "", code, payload))
         {
-            Serial.println("TailTrackerFetcher: track request failed");
+            Serial.println(F("TailTrackerFetcher: track request failed"));
             return false;
         }
-        if (parser.pendingKey != nullptr && parser.readingValue)
-            trackParserCommitValue(parser);
-        if (code != 200)
-        {
-            Serial.print("TailTrackerFetcher: track HTTP ");
-            Serial.println(code);
-            return false;
-        }
-        if (!hasPlausibleAircraftPosition(parser.lastLat, parser.lastLon))
-        {
-            Serial.println("TailTrackerFetcher: track positions array empty");
-            return false;
-        }
-        outLat = parser.lastLat;
-        outLon = parser.lastLon;
-        outAlt = parser.lastAlt;
-        return true;
     }
 #endif
 
