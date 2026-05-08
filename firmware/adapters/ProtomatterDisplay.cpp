@@ -382,7 +382,7 @@ static String formatElapsed(unsigned long seconds, bool landed)
     return formatDuration(seconds);
 }
 
-void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
+void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status, uint16_t tallyCount)
 {
     if (_matrix == nullptr) return;
 
@@ -640,6 +640,48 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status)
         const int16_t cy     = (int16_t)(_matrixHeight / 2);
         const int16_t radius = 11;
         drawCompass(cx, cy, radius, bearingDeg);
+    }
+
+    // --- Flight tally counter (top-left of compass zone, above the ring) ---
+    // 3px-wide × 5px-tall custom digits; same grey as compass cardinal letters.
+    // 1 digit: centred at (compassAreaX+2, 0); 2 digits: at (compassAreaX, 0).
+    {
+        static const uint8_t kDigits[10][5] = {
+            {0b111, 0b101, 0b101, 0b101, 0b111}, // 0
+            {0b010, 0b110, 0b010, 0b010, 0b111}, // 1
+            {0b111, 0b001, 0b111, 0b100, 0b111}, // 2
+            {0b111, 0b001, 0b011, 0b001, 0b111}, // 3
+            {0b101, 0b101, 0b111, 0b001, 0b001}, // 4
+            {0b111, 0b100, 0b111, 0b001, 0b111}, // 5
+            {0b111, 0b100, 0b111, 0b101, 0b111}, // 6
+            {0b111, 0b001, 0b001, 0b001, 0b001}, // 7
+            {0b111, 0b101, 0b111, 0b101, 0b111}, // 8
+            {0b111, 0b101, 0b111, 0b001, 0b111}, // 9
+        };
+
+        const uint16_t tallyColor = colorWithBrightness(_matrix,
+                                                        DisplayConfiguration::TAIL_COMPASS_NORTH_R,
+                                                        DisplayConfiguration::TAIL_COMPASS_NORTH_G,
+                                                        DisplayConfiguration::TAIL_COMPASS_NORTH_B);
+
+        auto drawDigit = [&](int16_t x0, int16_t y0, uint8_t digit) {
+            const uint8_t *rows = kDigits[digit];
+            for (int r = 0; r < 5; ++r)
+                for (int c = 0; c < 3; ++c)
+                    if (rows[r] & (0b100 >> c))
+                        _matrix->drawPixel(x0 + c, y0 + r, tallyColor);
+        };
+
+        const uint8_t capped = (tallyCount > 99) ? 99 : (uint8_t)tallyCount;
+        if (capped >= 10)
+        {
+            drawDigit(compassAreaX,     2, capped / 10);
+            drawDigit(compassAreaX + 4, 2, capped % 10);
+        }
+        else
+        {
+            drawDigit(compassAreaX + 2, 2, capped);
+        }
     }
 
     _matrix->show();

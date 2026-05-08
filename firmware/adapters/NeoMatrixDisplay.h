@@ -17,7 +17,7 @@ public:
     bool initialize() override;
     void clear() override;
     void displayFlights(const std::vector<FlightInfo> &flights) override;
-    void displayTailTracker(const TailFlightStatus &) {} // stub — not implemented on ESP32
+    void displayTailTracker(const TailFlightStatus &, uint16_t) {} // stub — not implemented on ESP32
     void displayTailLoading() {}                         // stub — not implemented on ESP32
 
     void displayMessage(const String &message);
