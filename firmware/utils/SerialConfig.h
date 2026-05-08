@@ -40,9 +40,19 @@ namespace SerialConfig
 {
     // Active runtime values — loaded from NVS/defaults in begin().
     // Read these wherever WiFi credentials and the tail number are needed.
-    extern String wifiSSID;
-    extern String wifiPassword;
-    extern String tailNumber;
+    extern String  wifiSSID;
+    extern String  wifiPassword;
+    extern String  tailNumber;
+
+    // Display brightness as a percentage (1–100).
+    // Applied immediately when changed; no restart required.
+    // Default comes from UserConfiguration::DISPLAY_BRIGHTNESS scaled to percent.
+    extern uint8_t brightness;
+
+    // Maximum number of flights in the nearby display pool (1–8).
+    // Once reached, new OpenSky discoveries are ignored until the 8-hour cycle
+    // resets.  Default comes from UserConfiguration::NEARBY_POOL_SIZE.
+    extern uint8_t nearbyPoolSize;
 
     // Call once in setup() after Serial.begin().
     void begin();
