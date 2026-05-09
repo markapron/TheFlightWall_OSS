@@ -247,6 +247,7 @@ void tick()
                 s_state = MenuState::ENTER_TALLY_RESET;
                 Serial.println();
                 Serial.print(F("New Tally Reset Time in Eastern HH:MM (Enter to keep current): "));
+                break;
             case '5':
                 s_state = MenuState::ENTER_BRIGHTNESS;
                 Serial.println();
@@ -325,6 +326,8 @@ void tick()
                     {
                         Serial.println(F("[invalid format — use HH:MM]"));
                     }
+                    break;
+                }
                 case MenuState::ENTER_BRIGHTNESS:
                 {
                     int bval = s_inputBuf.toInt();
