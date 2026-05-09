@@ -15,18 +15,17 @@ Responsibilities:
 #include "config/TimingConfiguration.h"
 #include "config/DisplayConfiguration.h"
 #include "utils/GeoUtils.h"
+#include "SerialConfig.h"
 
 static uint8_t scaleByBrightness(uint8_t c)
 {
-    // UserConfiguration::DISPLAY_BRIGHTNESS is 0-255, but the original project used very low
-    // values (e.g. 5) for NeoPixel matrices. On HUB75 panels this can be effectively black,
-    // so enforce a minimum for visible output.
-    uint16_t b = (uint16_t)UserConfiguration::DISPLAY_BRIGHTNESS;
-    if (b > 0 && b < 64)
-    {
-        b = 64;
-    }
-    return (uint8_t)(((uint16_t)c * b) / 255U);
+    // SerialConfig::brightness is 1-100 percent, updated live via serial menu.
+    // Convert to 0-255 and enforce a visible minimum so the panel is never black.
+    const uint16_t pct = (uint16_t)SerialConfig::brightness;
+    uint16_t b255 = (pct * 255u + 50u) / 100u; // round up
+    if (pct > 0 && b255 < 25u)
+        b255 = 25u; // minimum visible level on HUB75
+    return (uint8_t)(((uint16_t)c * b255) / 255u);
 }
 
 static uint16_t colorWithBrightness(Adafruit_Protomatter *m, uint8_t r, uint8_t g, uint8_t b)
@@ -147,9 +146,12 @@ void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
     const int16_t compassAreaX = (int16_t)_matrixWidth - 28;
     const int     maxCols      = (int)compassAreaX / charWidth;
 
-    // Line 1: airline / operator name
+    // Line 1: airline / operator name; fall back to callsign while awaiting enrichment.
     String airline = f.airline_display_name_full.length() ? f.airline_display_name_full
-                                                          : (f.operator_iata.length() ? f.operator_iata : (f.operator_icao.length() ? f.operator_icao : f.operator_code));
+                   : (f.operator_iata.length()            ? f.operator_iata
+                   : (f.operator_icao.length()            ? f.operator_icao
+                   : (f.operator_code.length()            ? f.operator_code
+                   : f.ident)));
     String line1 = truncateToColumns(airline, maxCols);
 
     // Line 2: route — ICAO with first char dim, remaining chars bright.
@@ -209,7 +211,11 @@ void ProtomatterDisplay::displaySingleFlightCard(const FlightInfo &f)
 
         drawAirport(origIcao, origIata, colsUsed);
 
-        if (colsUsed < maxCols)
+        // Only draw separator when at least one airport code is present so
+        // unenriched (position-only) flights don't show a lone ">".
+        const bool hasRoute = origIcao.length() || origIata.length()
+                           || dstIcao.length()  || dstIata.length();
+        if (hasRoute && colsUsed < maxCols)
         {
             _matrix->setTextColor(sepColor);
             _matrix->write('>');

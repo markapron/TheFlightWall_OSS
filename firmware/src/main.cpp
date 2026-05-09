@@ -1,14 +1,16 @@
-/*
+﻿/*
 Purpose: Firmware entry point for the FlightWall.
 Responsibilities:
 - Initialize serial, connect to Wi‑Fi, and construct fetchers and display.
 - Handle UP/DOWN button presses to switch between operating modes.
-- MODE_NEARBY: periodically fetch nearby state vectors and enrich with AeroAPI;
-  cycle through flight cards with route progress and a bearing compass like tail
-  tracker (layout on HUB75 / Protomatter).
-- MODE_TAIL_TRACKER: periodically fetch status (progress, time, position) for a
-  configured tail number and show a dedicated tracker screen with a progress bar
-  and reverse-geocoded city/state.
+- MODE_NEARBY: 8-hour sticky pool.  OpenSky is polled every FETCH_INTERVAL_SECONDS;
+  callsigns are added to the pool (and immediately enriched via AeroAPI) until the
+  pool reaches NEARBY_POOL_SIZE.  Once full, new aircraft are ignored.  After
+  NEARBY_POOL_CYCLE_SECONDS the entire pool is flushed and discovery restarts.
+  A 4-h per-callsign cache in FlightDataFetcher prevents duplicate AeroAPI calls.
+- MODE_TAIL_TRACKER: AeroAPI called ONCE per flight leg to get origin/destination
+  and timestamps; OpenSky fetchByIcao24 used for all subsequent position polls.
+  Progress is computed geometrically from cached airport coordinates.
 Configuration: UserConfiguration, TailTrackerConfiguration, TimingConfiguration,
                WiFiConfiguration, HardwareConfiguration.
 */
@@ -68,18 +70,28 @@ static AppMode g_prevActiveMode = MODE_NEARBY; // mode to restore after sleep/co
 
 static OpenSkyFetcher     g_openSky;
 static AeroAPIFetcher     g_aeroApi;
-static TailTrackerFetcher g_tailFetcher;
+static TailTrackerFetcher g_tailFetcher(&g_openSky); // OpenSky injected for position polls
 static FlightDataFetcher  g_flightDataFetcher(&g_openSky, &g_aeroApi);
 static ActiveDisplay      g_display;
 static AppMode            g_requestMode = MODE_COUNT;
 static uint8_t            g_consecutiveFetchFailures = 0;
 
 // MODE_NEARBY state
-static std::vector<FlightInfo> g_cachedFlights;
-static unsigned long           g_lastFetchMs = 0;
+// g_nearbyPool accumulates flights over an 8-hour cycle (g_poolStartMs).
+//   - New callsigns are added and enriched until NEARBY_POOL_SIZE is reached.
+//   - Once full the pool is frozen; new OpenSky discoveries are ignored.
+//   - After NEARBY_POOL_CYCLE_SECONDS the pool flushes and the cycle resets.
+//   - Position/bearing updates continue every FETCH_INTERVAL_SECONDS for all
+//     currently-visible pool entries.
+static std::vector<FlightInfo> g_nearbyPool;
+static unsigned long           g_poolStartMs  = 0; // start of current 8-h cycle (0 = unset)
+static unsigned long           g_lastFetchMs  = 0; // last OpenSky fetch timestamp
 static std::vector<FlightInfo> g_pendingFlights;
-static bool                    g_hasPendingFlights = false;
+static bool                    g_hasPendingFlights  = false;
 static unsigned long           g_lastNearbyRedrawMs = 0;
+
+// Legacy alias kept for the redraw path (g_cachedFlights used by nearbyRedrawIfDue).
+static std::vector<FlightInfo> &g_cachedFlights = g_nearbyPool;
 
 // MODE_TAIL_TRACKER state
 static TailFlightStatus  g_tailStatus;
@@ -280,8 +292,8 @@ static void checkButtons()
         {
             // UP always exits sleep / config and returns to the previous mode.
             g_appMode = g_prevActiveMode;
-            g_lastFetchMs     = 0;
-            g_lastTailFetchMs = 0;
+            g_lastFetchMs         = 0;
+            g_lastTailFetchMs     = 0;
             if (g_appMode == MODE_TAIL_TRACKER)
             {
                 g_lastTailRedrawMs = 0;
@@ -328,9 +340,9 @@ static void checkButtons()
             // Any press exits sleep immediately; reset tap counter.
             g_downTapCount   = 0;
             g_downFirstTapMs = 0;
-            g_appMode        = g_prevActiveMode;
-            g_lastFetchMs     = 0;
-            g_lastTailFetchMs = 0;
+            g_appMode             = g_prevActiveMode;
+            g_lastFetchMs         = 0;
+            g_lastTailFetchMs     = 0;
             if (g_appMode == MODE_TAIL_TRACKER)
             {
                 g_lastTailRedrawMs = 0;
@@ -520,6 +532,65 @@ void setup()
 }
 
 // ---------------------------------------------------------------------------
+// Nearby pool status — printed to serial after every OpenSky fetch cycle
+// ---------------------------------------------------------------------------
+
+static void printNearbyPoolStatus()
+{
+    const unsigned long nowMs          = millis();
+    const unsigned long cycleMs        = TimingConfiguration::NEARBY_POOL_CYCLE_SECONDS * 1000UL;
+    const unsigned long elapsedMs      = (g_poolStartMs > 0) ? (nowMs - g_poolStartMs) : 0;
+    const unsigned long remainingMs    = (elapsedMs < cycleMs) ? (cycleMs - elapsedMs) : 0;
+    const unsigned long remH           = remainingMs / 3600000UL;
+    const unsigned long remM           = (remainingMs % 3600000UL) / 60000UL;
+    const bool          poolFull       = g_nearbyPool.size() >= SerialConfig::nearbyPoolSize;
+
+    Serial.println(F("--- NEARBY POOL ---"));
+    Serial.print(F("  Flights : "));
+    Serial.print((int)g_nearbyPool.size());
+    Serial.print(F(" / "));
+    Serial.print((int)SerialConfig::nearbyPoolSize);
+    Serial.print(poolFull ? F(" (full)") : F(" (open)"));
+    Serial.print(F("  |  Cycle resets in: "));
+    Serial.print(remH);
+    Serial.print(F("h "));
+    Serial.print(remM);
+    Serial.println(F("m"));
+
+    for (size_t i = 0; i < g_nearbyPool.size(); ++i)
+    {
+        const FlightInfo &f = g_nearbyPool[i];
+        const bool enriched = f.origin.code_icao.length() > 0
+                           || f.origin.code_iata.length() > 0
+                           || f.operator_icao.length() > 0;
+        Serial.print(F("  ["));
+        if (i < 9) Serial.print(' ');
+        Serial.print((int)(i + 1));
+        Serial.print(F("] "));
+        Serial.print(f.ident);
+        Serial.print(enriched ? F(" (enriched)") : F(" (pending) "));
+        if (enriched)
+        {
+            Serial.print(F("  "));
+            const String &orig = f.origin.code_icao.length()  ? f.origin.code_icao
+                               : f.origin.code_iata.length()  ? f.origin.code_iata
+                               : String(F("???"));
+            const String &dst  = f.destination.code_icao.length() ? f.destination.code_icao
+                               : f.destination.code_iata.length() ? f.destination.code_iata
+                               : String(F("???"));
+            Serial.print(orig);
+            Serial.print(F(">"));
+            Serial.print(dst);
+        }
+        Serial.print(F("  @ "));
+        Serial.print(f.distance_km, 1);
+        Serial.print(F("km brg "));
+        Serial.println(f.bearing_deg, 0);
+    }
+    Serial.println(F("------------------"));
+}
+
+// ---------------------------------------------------------------------------
 // loop
 // ---------------------------------------------------------------------------
 
@@ -530,14 +601,22 @@ void loop()
     SerialConfig::tick();
     checkButtons();
 
-    // Drop the other mode’s heavy String-backed cache when switching views so
-    // nearby + tail never hold two full datasets at once.
+    // On mode transitions: release only the state specific to the mode being
+    // left.  The nearby pool (g_nearbyPool / g_poolStartMs) is preserved
+    // across all mode switches so the 8-hour cycle continues uninterrupted
+    // when the user returns to MODE_NEARBY.  The pool resets only via the
+    // 8-hour timer or a board restart.
     {
         static AppMode s_lastMode = static_cast<AppMode>(255);
         if (g_appMode != s_lastMode)
         {
             if (g_appMode == MODE_TAIL_TRACKER)
-                flightwallVectorDrop(g_cachedFlights);
+            {
+                // Release the pending display buffer; pool data is kept.
+                flightwallVectorDrop(g_pendingFlights);
+                g_hasPendingFlights  = false;
+                g_lastNearbyRedrawMs = 0;
+            }
             else if (g_appMode == MODE_NEARBY)
                 g_tailStatus = TailFlightStatus();
             // Reset previous-status when leaving tail tracker so re-entering
@@ -553,9 +632,9 @@ void loop()
         // Auto-exit serial config once the user closes the menu with 'x'.
         if (!SerialConfig::isMenuOpen())
         {
-            g_appMode = g_prevActiveMode;
-            g_lastFetchMs     = 0;
-            g_lastTailFetchMs = 0;
+            g_appMode             = g_prevActiveMode;
+            g_lastFetchMs         = 0;
+            g_lastTailFetchMs     = 0;
             if (g_appMode == MODE_TAIL_TRACKER)
             {
                 g_lastTailRedrawMs = 0;
@@ -578,66 +657,79 @@ void loop()
         return;
     }
 
-    // --- MODE_NEARBY: fetch nearby flights and cycle through them ---
+    // --- MODE_NEARBY: 8-hour sticky pool + OpenSky position refresh ---
     if (g_appMode == MODE_NEARBY)
     {
-        const unsigned long intervalMs = TimingConfiguration::FETCH_INTERVAL_SECONDS * 1000UL;
-        if ((g_lastFetchMs == 0 || now - g_lastFetchMs >= intervalMs) &&
-            WiFi.status() == WL_CONNECTED)
+        const unsigned long fetchIntervalMs = TimingConfiguration::FETCH_INTERVAL_SECONDS * 1000UL;
+        const unsigned long cycleLenMs      = TimingConfiguration::NEARBY_POOL_CYCLE_SECONDS * 1000UL;
+
+        // Flush the pool when the 8-hour cycle expires (or on first entry).
+        if (g_poolStartMs == 0 || now - g_poolStartMs >= cycleLenMs)
+        {
+            flightwallVectorDrop(g_nearbyPool);
+            g_poolStartMs = now;
+            g_lastFetchMs = 0; // fetch immediately after flush
+            Serial.println(F("Nearby pool: flushed — starting new 8-hour cycle."));
+        }
+
+        const bool doFetch = (g_lastFetchMs == 0 || now - g_lastFetchMs >= fetchIntervalMs);
+
+        if (doFetch && WiFi.status() == WL_CONNECTED)
         {
             std::vector<StateVector> states;
-            std::vector<FlightInfo>  flights;
             g_requestMode = MODE_NEARBY;
-            size_t enriched = g_flightDataFetcher.fetchFlights(states, flights);
+            bool ok = g_openSky.fetchStateVectors(
+                UserConfiguration::CENTER_LAT,
+                UserConfiguration::CENTER_LON,
+                UserConfiguration::RADIUS_KM,
+                states);
             g_requestMode = MODE_COUNT;
+
             if (g_appMode != MODE_NEARBY)
             {
-                flightwallVectorDrop(flights);
+                flightwallVectorDrop(states);
                 delay(10);
                 return;
             }
 
-            Serial.print("OpenSky state vectors: ");
-            Serial.println((int)states.size());
-            Serial.print("AeroAPI enriched flights: ");
-            Serial.println((int)enriched);
+            noteNetworkFetchResult(ok);
 
-            for (const auto &s : states)
+            if (ok)
             {
-                Serial.print(" ");
-                Serial.print(s.callsign);
-                Serial.print(" @ ");
-                Serial.print(s.distance_km, 1);
-                Serial.print("km bearing ");
-                Serial.println(s.bearing_deg, 1);
-            }
+                // Update positions of pool entries currently in range; add new
+                // callsigns until the pool reaches NEARBY_POOL_SIZE (then freeze).
+                size_t added = g_flightDataFetcher.updateStickyPool(
+                    g_nearbyPool, states, SerialConfig::nearbyPoolSize);
 
-            for (const auto &f : flights)
-            {
-                Serial.println("=== FLIGHT INFO ===");
-                Serial.print("Ident: ");
-                Serial.println(f.ident);
-                Serial.print("Airline: ");
-                Serial.println(f.airline_display_name_full);
-                Serial.print("Aircraft: ");
-                Serial.println(f.aircraft_display_name_short.length()
-                               ? f.aircraft_display_name_short : f.aircraft_code);
-                Serial.print("Route: ");
-                Serial.print(f.origin.code_icao);
-                Serial.print(" > ");
-                Serial.println(f.destination.code_icao);
-                Serial.println("===================");
-            }
+                // Enrich newly added entries (and any still-pending from a prior
+                // cycle).  4-h per-callsign cache prevents redundant AeroAPI hits.
+                size_t newEnriched = 0;
+                if (added > 0)
+                {
+                    newEnriched = g_flightDataFetcher.enrichNewPoolEntries(
+                        g_nearbyPool, states, UserConfiguration::MAX_ENRICHED_FLIGHTS);
+                }
 
-            g_cachedFlights = flights;
-            g_lastFetchMs   = millis();
-            // Stage new flights; apply on the next scheduled redraw boundary.
-            g_pendingFlights = flights;
+                if (added > 0 || newEnriched > 0)
+                {
+                    Serial.print(F("Nearby: +"));
+                    Serial.print((int)added);
+                    Serial.print(F(" added, "));
+                    Serial.print((int)newEnriched);
+                    Serial.println(F(" enriched via AeroAPI."));
+                }
+            }
+            flightwallVectorDrop(states);
+
+            g_lastFetchMs = millis();
+            printNearbyPoolStatus();
+
+            // Stage updated pool; apply on next scheduled redraw boundary.
+            g_pendingFlights    = g_nearbyPool;
             g_hasPendingFlights = true;
         }
 
-        // Re-check mode: it may have changed to SLEEP/CONFIG during the
-        // blocking fetch above (via displayTick → checkButtons).
+        // Re-check mode: it may have changed during the blocking fetch.
         if (g_appMode == MODE_NEARBY)
             nearbyRedrawIfDue(g_lastNearbyRedrawMs == 0);
     }

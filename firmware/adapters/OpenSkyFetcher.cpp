@@ -381,3 +381,136 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
     doc.clear();
     return true;
 }
+
+bool OpenSkyFetcher::fetchByIcao24(const String &icao24Hex, StateVector &outState)
+{
+    if (icao24Hex.length() == 0)
+        return false;
+
+    if (!ensureAccessToken(false))
+    {
+        Serial.println("OpenSkyFetcher: ensureAccessToken failed (fetchByIcao24)");
+        return false;
+    }
+
+    // Global query filtered by ICAO24 — no bbox needed; response is ≤1 entry.
+    const String url = String(APIConfiguration::OPENSKY_BASE_URL)
+                     + "/api/states/all?icao24=" + icao24Hex;
+
+    bool https = true;
+    String host;
+    uint16_t port = 443;
+    String path;
+    if (!parseUrl(url, https, host, port, path))
+    {
+        Serial.println("OpenSkyFetcher: Failed to parse icao24 URL");
+        return false;
+    }
+#if defined(FLIGHTWALL_SKIP_TLS)
+    https = false;
+    port = 80;
+#else
+    if (!https)
+    {
+        Serial.println("OpenSkyFetcher: Refusing non-HTTPS icao24 URL");
+        return false;
+    }
+#endif
+
+    int code = -1;
+    String payload;
+
+    auto doGet = [&]() -> bool {
+#if defined(ARDUINO_ARCH_ESP32)
+        FlightWallTlsClient net;
+        HttpClient http(net, host.c_str(), port);
+        http.setHttpResponseTimeout(30000);
+        http.beginRequest();
+        http.get(path);
+        http.sendHeader("Authorization", String("Bearer ") + m_accessToken);
+        http.endRequest();
+        code    = http.responseStatusCode();
+        payload = http.responseBody();
+        return true;
+#else
+        const String extraHeaders = String("Authorization: Bearer ") + m_accessToken
+                                  + "\r\nAccept: application/json\r\n";
+        return wifiClientRequest("GET", host, port, path, extraHeaders, "", code, payload);
+#endif
+    };
+
+    if (!doGet())
+    {
+        Serial.println("OpenSkyFetcher: icao24 GET failed");
+        return false;
+    }
+    if (code == 401 && ensureAccessToken(true))
+    {
+        flightwallStringDrop(payload);
+        if (!doGet())
+        {
+            Serial.println("OpenSkyFetcher: icao24 GET retry failed");
+            return false;
+        }
+    }
+    if (code != 200)
+    {
+        Serial.print("OpenSkyFetcher: icao24 HTTP ");
+        Serial.println(code);
+        flightwallStringDrop(payload);
+        return false;
+    }
+
+    // Single-aircraft response is small; 4 KB is ample.
+    DynamicJsonDocument doc(4096);
+    DeserializationError err = deserializeJson(doc, payload);
+    flightwallStringDrop(payload);
+    if (err)
+    {
+        Serial.print("OpenSkyFetcher: icao24 JSON error: ");
+        Serial.println(err.c_str());
+        doc.clear();
+        return false;
+    }
+
+    JsonArray states = doc["states"].as<JsonArray>();
+    if (states.isNull() || states.size() == 0)
+    {
+        doc.clear();
+        return false; // aircraft not currently transmitting / outside coverage
+    }
+
+    JsonArray a = states[0].as<JsonArray>();
+    if (a.isNull() || a.size() < 17)
+    {
+        doc.clear();
+        return false;
+    }
+
+    StateVector s;
+    s.icao24          = icao24Hex;
+    s.callsign        = a[1].isNull() ? String("") : String(a[1].as<const char *>());
+    s.callsign.trim();
+    s.origin_country  = a[2].isNull() ? String("") : String(a[2].as<const char *>());
+    s.time_position   = a[3].isNull() ? 0    : a[3].as<long>();
+    s.last_contact    = a[4].isNull() ? 0    : a[4].as<long>();
+    s.lon             = a[5].isNull() ? NAN  : a[5].as<double>();
+    s.lat             = a[6].isNull() ? NAN  : a[6].as<double>();
+    s.baro_altitude   = a[7].isNull() ? NAN  : a[7].as<double>();
+    s.on_ground       = a[8].isNull() ? false : a[8].as<bool>();
+    s.velocity        = a[9].isNull() ? NAN  : a[9].as<double>();
+    s.heading         = a[10].isNull() ? NAN : a[10].as<double>();
+    s.vertical_rate   = a[11].isNull() ? NAN : a[11].as<double>();
+    s.geo_altitude    = a[13].isNull() ? NAN : a[13].as<double>();
+    s.squawk          = a[14].isNull() ? String("") : String(a[14].as<const char *>());
+    s.spi             = a[15].isNull() ? false : a[15].as<bool>();
+    s.position_source = a[16].isNull() ? 0   : a[16].as<int>();
+
+    doc.clear();
+
+    if (isnan(s.lat) || isnan(s.lon))
+        return false;
+
+    outState = s;
+    return true;
+}
