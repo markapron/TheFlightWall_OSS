@@ -20,7 +20,7 @@ public:
     void displayFlights(const std::vector<FlightInfo> &flights) override;
 
     // Tail tracker mode display.
-    void displayTailTracker(const TailFlightStatus &status);
+    void displayTailTracker(const TailFlightStatus &status, uint16_t tallyCount);
     void displayTailLoading();
 
     void displayMessage(const String &message);
@@ -52,7 +52,7 @@ public:
     bool initialize() override { return false; }
     void clear() override {}
     void displayFlights(const std::vector<FlightInfo> &) override {}
-    void displayTailTracker(const TailFlightStatus &) {}
+    void displayTailTracker(const TailFlightStatus &, uint16_t) {}
     void displayTailLoading() {}
     void displayMessage(const String &) {}
     void showLoading() {}

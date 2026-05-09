@@ -19,7 +19,7 @@
   // A magic number at the front distinguishes an initialised block from
   // blank flash (0xFFFF…).  Bump the version nibble if the layout changes
   // so old data is safely ignored after a firmware update.
-  static const uint32_t kSAMDConfigMagic = 0xF17E0003UL;
+  static const uint32_t kSAMDConfigMagic = 0xF17E0002UL;
 
   // Magic bumped to 0xF17E0003 when nearbyPoolSize field was added.
   // Old data with earlier magic values will be discarded; re-enter settings.
@@ -29,6 +29,7 @@
       char     ssid[64];
       char     pass[64];
       char     tail[32];
+      uint16_t tallyResetMinutes; // minutes from Eastern midnight (0-1439)
       uint8_t  brightness;     // 1-100 percent
       uint8_t  nearbyPoolSize; // 1-8 flights
   };
@@ -41,9 +42,10 @@ namespace SerialConfig
 // Public runtime values — start from compile-time defaults in Secrets.h
 // ---------------------------------------------------------------------------
 
-String  wifiSSID       = SECRET_WIFI_SSID;
-String  wifiPassword   = SECRET_WIFI_PASSWORD;
-String  tailNumber     = SECRET_TRACKED_TAIL_NUMBER;
+String   wifiSSID          = SECRET_WIFI_SSID;
+String   wifiPassword      = SECRET_WIFI_PASSWORD;
+String   tailNumber        = SECRET_TRACKED_TAIL_NUMBER;
+uint16_t tallyResetMinutes = 1080; // default 18:00 Eastern
 // Default: scale compile-time DISPLAY_BRIGHTNESS (0-255) to a percent (1-100).
 uint8_t brightness     = (uint8_t)((UserConfiguration::DISPLAY_BRIGHTNESS * 100u + 127u) / 255u);
 uint8_t nearbyPoolSize = (uint8_t)UserConfiguration::NEARBY_POOL_SIZE;
@@ -59,6 +61,7 @@ enum class MenuState
     ENTER_SSID,
     ENTER_PASS,
     ENTER_TAIL,
+    ENTER_TALLY_RESET,
     ENTER_BRIGHTNESS,
     ENTER_POOL_SIZE,
 };
@@ -77,10 +80,14 @@ static const char *kNS = "flightwall";
 
 static void printMenu()
 {
+    char resetBuf[8];
+    snprintf(resetBuf, sizeof(resetBuf), "%02u:%02u",
+             (unsigned)(tallyResetMinutes / 60), (unsigned)(tallyResetMinutes % 60));
+
     Serial.println();
     Serial.println(F("=== FlightWall Config ==="));
     Serial.print  (F("  WiFi SSID  : ")); Serial.println(wifiSSID);
-    Serial.print(F("  WiFi Pass  : "));
+    Serial.print  (F("  WiFi Pass  : "));
     if (wifiPassword.length())
     {
         Serial.print(wifiPassword.length());
@@ -91,14 +98,16 @@ static void printMenu()
         Serial.println(F("(none)"));
     }
     Serial.print  (F("  Tail Number: ")); Serial.println(tailNumber);
+    Serial.print  (F("  Tally Reset: ")); Serial.print(resetBuf); Serial.println(F(" Eastern"));
     Serial.print  (F("  Brightness : ")); Serial.print(brightness); Serial.println(F("%"));
     Serial.print  (F("  Pool Size  : ")); Serial.print(nearbyPoolSize); Serial.println(F(" flights (max 8)"));
     Serial.println(F("-------------------------"));
     Serial.println(F("  1) Change WiFi SSID"));
     Serial.println(F("  2) Change WiFi Password"));
     Serial.println(F("  3) Change Tail Number"));
-    Serial.println(F("  4) Change Brightness (1-100%)  <-- applies immediately"));
-    Serial.println(F("  5) Change Nearby Pool Size (1-8)  <-- takes effect on next cycle"));
+    Serial.println(F("  4) Change Tally Reset Time (Eastern HH:MM)"));
+    Serial.println(F("  5) Change Brightness (1-100%)  <-- applies immediately"));
+    Serial.println(F("  6) Change Nearby Pool Size (1-8)  <-- takes effect on next cycle"));
     Serial.println(F("  r) Save & restart  <-- required after WiFi changes"));
     Serial.println(F("  x) Close menu"));
     Serial.println(F("========================="));
@@ -109,9 +118,10 @@ static void persistValues()
 {
 #if defined(ARDUINO_ARCH_ESP32)
     s_prefs.begin(kNS, false);
-    s_prefs.putString("ssid", wifiSSID);
-    s_prefs.putString("pass", wifiPassword);
-    s_prefs.putString("tail", tailNumber);
+    s_prefs.putString("ssid",       wifiSSID);
+    s_prefs.putString("pass",       wifiPassword);
+    s_prefs.putString("tail",       tailNumber);
+    s_prefs.putUInt  ("tallyReset", tallyResetMinutes);
     s_prefs.putUChar("bri",  brightness);
     s_prefs.putUChar("pool", nearbyPoolSize);
     s_prefs.end();
@@ -119,7 +129,8 @@ static void persistValues()
 
 #else
     SAMDPersistedConfig cfg;
-    cfg.magic          = kSAMDConfigMagic;
+    cfg.magic             = kSAMDConfigMagic;
+    cfg.tallyResetMinutes = tallyResetMinutes;
     cfg.brightness     = brightness;
     cfg.nearbyPoolSize = nearbyPoolSize;
     memset(cfg.ssid, 0, sizeof(cfg.ssid));
@@ -138,15 +149,17 @@ static void loadPersistedValues()
 {
 #if defined(ARDUINO_ARCH_ESP32)
     s_prefs.begin(kNS, true);
-    String  s = s_prefs.getString("ssid", "");
-    String  p = s_prefs.getString("pass", "");
-    String  t = s_prefs.getString("tail", "");
+    String s  = s_prefs.getString("ssid",       "");
+    String p  = s_prefs.getString("pass",       "");
+    String t  = s_prefs.getString("tail",       "");
+    uint32_t r = s_prefs.getUInt ("tallyReset", 1080);
     uint8_t b = s_prefs.getUChar("bri",  0);
     uint8_t n = s_prefs.getUChar("pool", 0);
     s_prefs.end();
     if (s.length())          wifiSSID       = s;
     if (p.length())          wifiPassword   = p;
     if (t.length())          tailNumber     = t;
+    tallyResetMinutes = (uint16_t)(r < 1440 ? r : 1080);
     if (b >= 1 && b <= 100) brightness     = b;
     if (n >= 1 && n <= 8)   nearbyPoolSize = n;
 
@@ -161,6 +174,7 @@ static void loadPersistedValues()
         if (strlen(cfg.ssid) > 0)                              wifiSSID       = cfg.ssid;
         if (strlen(cfg.pass) > 0)                              wifiPassword   = cfg.pass;
         if (strlen(cfg.tail) > 0)                              tailNumber     = cfg.tail;
+        tallyResetMinutes = (cfg.tallyResetMinutes < 1440) ? cfg.tallyResetMinutes : 1080;
         if (cfg.brightness     >= 1 && cfg.brightness <= 100)  brightness     = cfg.brightness;
         if (cfg.nearbyPoolSize >= 1 && cfg.nearbyPoolSize <= 8) nearbyPoolSize = cfg.nearbyPoolSize;
         Serial.println(F("[config loaded from flash]"));
@@ -230,11 +244,16 @@ void tick()
                 Serial.print(F("New Tail Number (Enter to keep current): "));
                 break;
             case '4':
+                s_state = MenuState::ENTER_TALLY_RESET;
+                Serial.println();
+                Serial.print(F("New Tally Reset Time in Eastern HH:MM (Enter to keep current): "));
+                break;
+            case '5':
                 s_state = MenuState::ENTER_BRIGHTNESS;
                 Serial.println();
                 Serial.print(F("New Brightness 1-100% (Enter to keep current): "));
                 break;
-            case '5':
+            case '6':
                 s_state = MenuState::ENTER_POOL_SIZE;
                 Serial.println();
                 Serial.print(F("New Nearby Pool Size 1-8 (Enter to keep current): "));
@@ -281,6 +300,34 @@ void tick()
                     Serial.print(tailNumber);
                     Serial.println(F(" — takes effect on next fetch."));
                     break;
+                case MenuState::ENTER_TALLY_RESET:
+                {
+                    const int colonIdx = s_inputBuf.indexOf(':');
+                    if (colonIdx > 0)
+                    {
+                        const int h = s_inputBuf.substring(0, colonIdx).toInt();
+                        const int m = s_inputBuf.substring(colonIdx + 1).toInt();
+                        if (h >= 0 && h <= 23 && m >= 0 && m <= 59)
+                        {
+                            tallyResetMinutes = (uint16_t)(h * 60 + m);
+                            persistValues();
+                            char buf[8];
+                            snprintf(buf, sizeof(buf), "%02d:%02d", h, m);
+                            Serial.print(F("Tally reset time set to "));
+                            Serial.print(buf);
+                            Serial.println(F(" Eastern."));
+                        }
+                        else
+                        {
+                            Serial.println(F("[invalid time value — no change]"));
+                        }
+                    }
+                    else
+                    {
+                        Serial.println(F("[invalid format — use HH:MM]"));
+                    }
+                    break;
+                }
                 case MenuState::ENTER_BRIGHTNESS:
                 {
                     int bval = s_inputBuf.toInt();

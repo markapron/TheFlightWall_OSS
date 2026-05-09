@@ -40,9 +40,10 @@ namespace SerialConfig
 {
     // Active runtime values — loaded from NVS/defaults in begin().
     // Read these wherever WiFi credentials and the tail number are needed.
-    extern String  wifiSSID;
-    extern String  wifiPassword;
-    extern String  tailNumber;
+    extern String   wifiSSID;
+    extern String   wifiPassword;
+    extern String   tailNumber;
+    extern uint16_t tallyResetMinutes; // minutes from Eastern midnight, default 1080 (18:00)
 
     // Display brightness as a percentage (1–100).
     // Applied immediately when changed; no restart required.

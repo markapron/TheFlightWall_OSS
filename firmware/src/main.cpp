@@ -31,6 +31,7 @@ Configuration: UserConfiguration, TailTrackerConfiguration, TimingConfiguration,
 #include "adapters/TailTrackerFetcher.h"
 #include "core/FlightDataFetcher.h"
 #include "models/TailFlightStatus.h"
+#include "utils/GeoUtils.h"
 #include "utils/HttpUtils.h"
 #include "utils/MemoryUtils.h"
 #include "utils/RamStats.h"
@@ -97,6 +98,11 @@ static TailFlightStatus  g_tailStatus;
 static unsigned long     g_lastTailFetchMs  = 0;
 static unsigned long     g_lastTailRedrawMs = 0;
 static unsigned long     g_lastMemLogMs     = 0;
+
+// Flight tally — RAM only (cleared on reboot, survives mode switches).
+static bool          g_prevIsAirborne    = false;
+static uint16_t      g_tallyCount        = 0;
+static unsigned long g_tallyLastResetDay = 0;   // Eastern epoch day of last reset; 0 = never
 
 // ---------------------------------------------------------------------------
 // Button handling — forward declaration so displayTick can call it
@@ -198,7 +204,7 @@ static void tailTrackerRedrawIfDue(bool force)
     g_lastTailRedrawMs = now;
 
     if (g_tailStatus.valid)
-        g_display.displayTailTracker(g_tailStatus);
+        g_display.displayTailTracker(g_tailStatus, g_tallyCount);
     else
         g_display.displayTailLoading();
 }
@@ -612,10 +618,11 @@ void loop()
                 g_lastNearbyRedrawMs = 0;
             }
             else if (g_appMode == MODE_NEARBY)
-            {
-                g_tailStatus  = TailFlightStatus();
-                g_lastFetchMs = 0; // refresh positions immediately on re-entry
-            }
+                g_tailStatus = TailFlightStatus();
+            // Reset previous-status when leaving tail tracker so re-entering
+            // and immediately observing "Flying" counts as a new flight.
+            if (s_lastMode == MODE_TAIL_TRACKER && g_appMode != MODE_TAIL_TRACKER)
+                g_prevIsAirborne = false;
             s_lastMode = g_appMode;
         }
     }
@@ -753,6 +760,33 @@ void loop()
 
             if (fetchOk)
             {
+                // --- Daily reset check (Eastern time) ---
+                if (newStatus.fetch_epoch > 0)
+                {
+                    const long offsetSec =
+                        (long)getEasternOffsetMinutes(newStatus.fetch_epoch) * 60L;
+                    const unsigned long easternEpoch =
+                        (unsigned long)((long)newStatus.fetch_epoch + offsetSec);
+                    const unsigned long easternDay = easternEpoch / 86400UL;
+                    const unsigned long easternTOD = easternEpoch % 86400UL;
+                    const unsigned long resetSec   =
+                        (unsigned long)SerialConfig::tallyResetMinutes * 60UL;
+                    if (easternDay > g_tallyLastResetDay && easternTOD >= resetSec)
+                    {
+                        g_tallyCount        = 0;
+                        g_tallyLastResetDay = easternDay;
+                    }
+                }
+
+                // --- Increment on any → airborne transition (matches display logic) ---
+                const bool newIsAirborne = newStatus.actual_off_epoch > 0
+                                        && newStatus.actual_on_epoch  == 0;
+                if (newIsAirborne && !g_prevIsAirborne)
+                {
+                    if (g_tallyCount < 99) ++g_tallyCount;
+                }
+                g_prevIsAirborne = newIsAirborne;
+
                 g_tailStatus = newStatus;
                 tailTrackerRedrawIfDue(true);
                 Serial.print("TailTracker: status=");
