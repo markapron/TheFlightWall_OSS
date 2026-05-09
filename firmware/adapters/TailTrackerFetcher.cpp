@@ -1,9 +1,9 @@
 /*
 Purpose: Fetch real-time status for a tracked tail number.
 AeroAPI is called ONCE per flight leg to obtain route metadata (origin, destination,
-timestamps).  All subsequent position updates use OpenSky via fetchByIcao24(), which
-is free and requires no API key.  Flight progress is computed geometrically.
-Nominatim reverse-geocoding is rate-limited by a distance threshold cache.
+timestamps).  Position is maintained exclusively by the 30-second OpenSky timer in
+main.cpp via updateStickyPosition().  Flight progress is computed geometrically.
+Nominatim reverse-geocoding is rate-limited by a time-interval cache.
 */
 #include "adapters/TailTrackerFetcher.h"
 
@@ -11,6 +11,7 @@ Nominatim reverse-geocoding is rate-limited by a distance threshold cache.
 #include <ArduinoHttpClient.h>
 #include "config/APIConfiguration.h"
 #include "config/TailTrackerConfiguration.h"
+#include "utils/GeoUtils.h"
 #include "utils/HttpUtils.h"
 #include "utils/MemoryUtils.h"
 #include <stdlib.h>
@@ -69,9 +70,6 @@ static unsigned long s_cachedFetchMillis  = 0;
 static double        s_stickyLat = NAN;
 static double        s_stickyLon = NAN;
 static int           s_stickyAlt = 0;
-
-// Was the aircraft airborne on the previous successful OpenSky poll?
-static bool          s_wasAirborne = false;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -204,11 +202,13 @@ static void appendUrlQueryEncoded(const String &s, String &out)
 }
 
 // ---------------------------------------------------------------------------
-// Constructor
+// flagRouteNeedsRefresh — called from main.cpp landing detection
 // ---------------------------------------------------------------------------
 
-TailTrackerFetcher::TailTrackerFetcher(OpenSkyFetcher *openSky)
-    : _openSky(openSky) {}
+void TailTrackerFetcher::flagRouteNeedsRefresh()
+{
+    s_routeNeedsRefresh = true;
+}
 
 // ---------------------------------------------------------------------------
 // fetchRouteFromAeroAPI — called once per flight leg; caches route metadata
@@ -324,11 +324,28 @@ bool TailTrackerFetcher::fetchRouteFromAeroAPI(const String &ident)
     unsigned long nowEpoch = (unsigned long)time(nullptr);
 #endif
 
-    // Pass 1: prefer the leg currently airborne (actual_off set, actual_on not set).
+    // Debug: dump all flights so the selection decision is visible in the serial log.
+    for (size_t i = 0; i < flights.size(); ++i) {
+        Serial.print(F("  flight[")); Serial.print(i); Serial.print(F("]: status="));
+        Serial.print(safeStr(flights[i], "status"));
+        Serial.print(F(" actual_off="));
+        Serial.print(flights[i]["actual_off"].isNull() ? "(null)" : safeStr(flights[i], "actual_off").c_str());
+        Serial.print(F(" actual_on="));
+        Serial.println(flights[i]["actual_on"].isNull() ? "(null)" : safeStr(flights[i], "actual_on").c_str());
+    }
+
+    // Pass 1: prefer the leg currently airborne.
+    // Two indicators: timestamp pair (actual_off set, actual_on absent) OR AeroAPI status
+    // string ("En Route…" / "Arriving…"), which is set before actual_off is confirmed and
+    // also when actual_on is pre-populated with an estimated arrival time.
     int  bestIdx       = 0;
     bool foundAirborne = false;
     for (size_t i = 0; i < flights.size(); ++i) {
-        if (!flights[i]["actual_off"].isNull() && flights[i]["actual_on"].isNull()) {
+        const bool offSet   = !flights[i]["actual_off"].isNull();
+        const bool onAbsent =  flights[i]["actual_on"].isNull();
+        const String st     = safeStr(flights[i], "status");
+        const bool enRoute  = st.startsWith("En Route") || st.startsWith("Arriving");
+        if ((offSet && onAbsent) || enRoute) {
             bestIdx = (int)i; foundAirborne = true; break;
         }
     }
@@ -497,7 +514,6 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
         s_stickyLat         = NAN;
         s_stickyLon         = NAN;
         s_stickyAlt         = 0;
-        s_wasAirborne       = false;
         Serial.print(F("TailTracker: tracking new ident "));
         Serial.println(ident);
     }
@@ -548,104 +564,39 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
     result.fetch_millis     = s_cachedFetchMillis;
     result.progress_percent = 0;
 
-    // --- Try OpenSky for current position ---
-    bool gotPosition = false;
+    // --- Position from sticky (maintained by the 30-second OpenSky timer in main.cpp) ---
+    if (hasPlausibleLatLon(s_stickyLat, s_stickyLon))
+    {
+        result.lat         = s_stickyLat;
+        result.lon         = s_stickyLon;
+        result.altitude_ft = s_stickyAlt;
 
-    if (s_cachedIcao24.length() > 0 && _openSky != nullptr) {
-        StateVector sv;
-        if (_openSky->fetchByIcao24(s_cachedIcao24, sv)
-                && hasPlausibleLatLon(sv.lat, sv.lon)) {
-
-            result.lat         = sv.lat;
-            result.lon         = sv.lon;
-            result.altitude_ft = isnan(sv.baro_altitude) ? 0
-                               : (int)(sv.baro_altitude * 3.28084f);
-            gotPosition = true;
-
-            // Compute geometric progress from cached origin/dest coordinates.
-            if (hasPlausibleLatLon(s_cachedOriginLat, s_cachedOriginLon) &&
-                hasPlausibleLatLon(s_cachedDestLat,   s_cachedDestLon))
-            {
-                const double total = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
-                                                 s_cachedDestLat,   s_cachedDestLon);
-                if (total > 10.0) {
-                    const double traveled = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
-                                                        sv.lat, sv.lon);
-                    int prog = (int)lround((traveled * 100.0) / total);
-                    if (prog < 0)   prog = 0;
-                    if (prog > 100) prog = 100;
-                    result.progress_percent = prog;
-                }
+        if (hasPlausibleLatLon(s_cachedOriginLat, s_cachedOriginLon) &&
+            hasPlausibleLatLon(s_cachedDestLat,   s_cachedDestLon))
+        {
+            const double total = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
+                                             s_cachedDestLat,   s_cachedDestLon);
+            if (total > 10.0) {
+                const double traveled = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
+                                                    s_stickyLat, s_stickyLon);
+                int prog = (int)lround((traveled * 100.0) / total);
+                if (prog < 0)   prog = 0;
+                if (prog > 100) prog = 100;
+                result.progress_percent = prog;
             }
-
-            // Infer flight status from on_ground flag and airborne history.
-            const bool wasAirborne = s_wasAirborne;
-            if (!sv.on_ground) {
-                result.status    = "Flying";
-                s_wasAirborne    = true;
-                result.actual_on_epoch = 0; // not yet landed
-            } else {
-                if (wasAirborne) {
-                    // Transition: just landed → fetch next leg from AeroAPI.
-                    result.status       = "Landed";
-                    s_wasAirborne       = false;
-                    s_routeNeedsRefresh = true;
-                    Serial.println(F("TailTracker: landing detected via OpenSky"));
-                } else {
-                    result.status = (s_cachedActualOn > 0) ? "Landed" : "On Ground";
-                }
-            }
-            if (result.progress_percent == 100 && sv.on_ground)
-                result.status = "Landed";
-
-            // Update sticky position.
-            s_stickyLat = sv.lat;
-            s_stickyLon = sv.lon;
-            s_stickyAlt = result.altitude_ft;
-
-            // Reverse-geocode current location.
-            fetchReverseGeocode(sv.lat, sv.lon, result.city, result.region);
-
-        } else {
-            Serial.print(F("TailTracker: not found on OpenSky (icao24="));
-            Serial.print(s_cachedIcao24);
-            Serial.println(')');
         }
-    } else if (s_cachedIcao24.length() == 0) {
-        Serial.println(F("TailTracker: ICAO24 unknown — OpenSky position unavailable"));
     }
 
-    // --- Fall back to sticky position when OpenSky had no data ---
-    if (!gotPosition) {
-        if (hasPlausibleLatLon(s_stickyLat, s_stickyLon)) {
-            result.lat         = s_stickyLat;
-            result.lon         = s_stickyLon;
-            result.altitude_ft = s_stickyAlt;
-
-            if (hasPlausibleLatLon(s_cachedOriginLat, s_cachedOriginLon) &&
-                hasPlausibleLatLon(s_cachedDestLat,   s_cachedDestLon))
-            {
-                const double total = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
-                                                 s_cachedDestLat,   s_cachedDestLon);
-                if (total > 10.0) {
-                    const double traveled = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
-                                                        s_stickyLat, s_stickyLon);
-                    int prog = (int)lround((traveled * 100.0) / total);
-                    if (prog < 0)   prog = 0;
-                    if (prog > 100) prog = 100;
-                    result.progress_percent = prog;
-                }
-            }
-        }
-
-        // Use city/region from cached AeroAPI data.
-        if (result.actual_on_epoch > 0) {
-            result.city   = s_cachedDestCity;
-            result.region = s_cachedDestRegion;
-        } else if (result.actual_off_epoch == 0) {
-            result.city   = s_cachedOriginCity;
-            result.region = s_cachedOriginRegion;
-        }
+    // City/region: landed → destination; pre-departure → origin; airborne → last geocode.
+    if (result.actual_on_epoch > 0) {
+        result.city   = s_cachedDestCity;
+        result.region = s_cachedDestRegion;
+    } else if (result.actual_off_epoch == 0) {
+        result.city   = s_cachedOriginCity;
+        result.region = s_cachedOriginRegion;
+    } else {
+        result.city   = _lastCity;
+        result.region = _lastRegion;
     }
 
     // AeroAPI lands set progress to 100.

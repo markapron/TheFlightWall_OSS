@@ -2,30 +2,26 @@
 
 #include <Arduino.h>
 #include "models/TailFlightStatus.h"
-#include "adapters/OpenSkyFetcher.h"
 
 /*
 Purpose: Fetch real-time status for a tracked tail number.
 Strategy:
   - Route data (origin, destination, timestamps, ident) is fetched from AeroAPI
     ONCE per flight leg and cached.  This dramatically reduces AeroAPI usage.
-  - For US N-number registrations the ICAO24 transponder address is computed
-    locally (no API call) so OpenSky can locate the aircraft globally via
-    fetchByIcao24() on every poll.
-  - Position, altitude, and on-ground status come from OpenSky on every call.
+  - Position, altitude, and on-ground status come exclusively from the 30-second
+    OpenSky timer in main.cpp via updateStickyPosition() / fetchReverseGeocode().
+    fetchStatus() never calls OpenSky directly.
   - Flight progress is computed geometrically from the cached origin/destination
-    coordinates and the current OpenSky position.
-  - Reverse geocoding (Nominatim) is called only when the aircraft moves more
-    than GEO_CACHE_THRESHOLD_KM since the last geocode.
+    coordinates and the sticky position.
   - AeroAPI is refreshed when:
       * The configured ident changes.
-      * A landing transition is detected (on_ground flip while airborne).
+      * flagRouteNeedsRefresh() is called (e.g. landing detected via OpenSky).
       * The cached route is older than ROUTE_REFRESH_INTERVAL_MS (safety net).
 */
 class TailTrackerFetcher
 {
 public:
-    explicit TailTrackerFetcher(OpenSkyFetcher *openSky);
+    TailTrackerFetcher() = default;
 
     // Populate `out` with the most recent flight data for `ident`.
     // Returns true on success; `out` is left unchanged on failure.
@@ -37,13 +33,19 @@ public:
                              String &outCity, String &outRegion);
 
     // Keep the persistent sticky position in sync with live OpenSky fixes so that
-    // when AeroAPI fetchStatus falls back to sticky (no last_position in response)
-    // it uses the most recent known location rather than a stale en-route fix.
+    // fetchStatus() can use the most recent known location for progress computation.
     static void updateStickyPosition(double lat, double lon, int altFt);
 
-private:
-    OpenSkyFetcher *_openSky;
+    // Signal that the cached route should be re-fetched from AeroAPI on the next
+    // fetchStatus() call.  Called from main.cpp when OpenSky detects landing.
+    static void flagRouteNeedsRefresh();
 
+    // Compute ICAO24 hex address from a US FAA N-number registration.
+    // Returns true and sets outHex (6 hex chars + NUL) for valid N-numbers.
+    // Returns false for non-N-number idents (flight numbers, foreign regs).
+    static bool nNumberToIcao24(const String &nNumber, char outHex[7]);
+
+private:
     // Cached reverse-geocode result — refreshed on a time interval.
     unsigned long _lastGeocodeMs = 0;
     String _lastCity;
@@ -69,9 +71,4 @@ private:
                                            double &outLat, double &outLon);
 
     static const char *usStateAbbrev(const char *fullName);
-
-    // Compute ICAO24 hex address from a US FAA N-number registration.
-    // Returns true and sets outIcao24 (6 hex chars) for valid N-numbers.
-    // Returns false for non-N-number idents (flight numbers, foreign regs).
-    static bool nNumberToIcao24(const String &nNumber, char outHex[7]);
 };

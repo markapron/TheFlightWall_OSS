@@ -17,6 +17,9 @@ The git repo is in one directory up from here. Always prompt the user for approv
 
 Built with **PlatformIO**. No separate install step — dependencies are declared in `platformio.ini` and fetched automatically.
 
+To build in the terminal use this command:
+PowerShell(cd "E:\ws\TheFlightWall_OSS\firmware"; & "C:\Users\Mark\.platformio\penv\Scripts\pio.exe" run -e adafruit_matrix_portal_m4 2>&1)
+
 ```bash
 # Matrix Portal M4 (primary target)
 pio run -e adafruit_matrix_portal_m4 --target upload

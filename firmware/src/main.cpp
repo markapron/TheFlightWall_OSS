@@ -70,7 +70,7 @@ static AppMode g_prevActiveMode = MODE_NEARBY; // mode to restore after sleep/co
 
 static OpenSkyFetcher     g_openSky;
 static AeroAPIFetcher     g_aeroApi;
-static TailTrackerFetcher g_tailFetcher(&g_openSky); // OpenSky injected for position polls
+static TailTrackerFetcher g_tailFetcher;
 static FlightDataFetcher  g_flightDataFetcher(&g_openSky, &g_aeroApi);
 static ActiveDisplay      g_display;
 static AppMode            g_requestMode = MODE_COUNT;
@@ -209,6 +209,117 @@ static void tailTrackerRedrawIfDue(bool force)
         g_display.displayTailTracker(g_tailStatus, g_tallyCount);
     else
         g_display.displayTailLoading();
+}
+
+// Print a structured snapshot of the current tail tracker state to Serial.
+// Called after AeroAPI enrichment and after each OpenSky position update so
+// the console always reflects the data currently driving the display.
+static void printTailDebug(const char *source)
+{
+    const TailFlightStatus &s = g_tailStatus;
+
+    const bool isLanded   = s.actual_on_epoch  > 0;
+    const bool isAirborne = s.actual_off_epoch > 0 && !isLanded;
+    const bool hasPos     = !isnan(s.lat) && !isnan(s.lon)
+                            && !(s.lat == 0.0 && s.lon == 0.0);
+
+    // Recompute current epoch the same way the display does.
+    unsigned long nowEpoch = 0;
+    if (s.fetch_epoch > 0)
+        nowEpoch = s.fetch_epoch + (millis() - s.fetch_millis) / 1000UL;
+
+    Serial.println(F(""));
+    Serial.print(F("=== TailTracker ["));
+    Serial.print(source);
+    Serial.println(F("] ==="));
+
+    // --- Fetched data ---
+    Serial.print(F("  ident="));       Serial.print(s.ident);
+    Serial.print(F("  icao24="));      Serial.print(g_cachedTailIcao24.length() ? g_cachedTailIcao24 : F("(unknown)"));
+    Serial.print(F("  status="));      Serial.println(s.status);
+
+    Serial.print(F("  lat="));
+    if (hasPos) { Serial.print(s.lat, 4); Serial.print(F("  lon=")); Serial.print(s.lon, 4); }
+    else Serial.print(F("(none)"));
+    Serial.print(F("  alt="));         Serial.print(s.altitude_ft);  Serial.println(F("ft"));
+
+    Serial.print(F("  actual_off="));  Serial.print(s.actual_off_epoch);
+    Serial.print(F("  actual_on="));   Serial.print(s.actual_on_epoch);
+    Serial.print(F("  isAirborne="));  Serial.print(isAirborne ? F("Y") : F("N"));
+    Serial.print(F("  isLanded="));    Serial.println(isLanded   ? F("Y") : F("N"));
+
+    Serial.print(F("  origin="));      Serial.print(s.origin_code.length() ? s.origin_code : F("?"));
+    Serial.print(F("  dest="));        Serial.print(s.dest_code.length()   ? s.dest_code   : F("?"));
+    Serial.print(F("  progress="));    Serial.print(s.progress_percent);   Serial.println(F("%"));
+
+    Serial.print(F("  city="));        Serial.print(s.city.length()   ? s.city   : F("(none)"));
+    Serial.print(F("  region="));      Serial.println(s.region.length() ? s.region : F("(none)"));
+
+    // --- What the display will render ---
+    Serial.println(F("  --- display ---"));
+
+    // Line 1
+    String line1;
+    if (isAirborne && s.dest_code.length() > 0)
+    {
+        line1 = "Flying to ";
+        line1 += s.dest_code;
+    }
+    else
+    {
+        line1 = s.status.length() > 0 ? s.status : "No Data";
+        if (s.dest_code.length() > 0) { line1 += ' '; line1 += s.dest_code; }
+    }
+    Serial.print(F("  Line1: "));  Serial.println(line1);
+
+    // Line 2
+    String line2;
+    if (isAirborne && s.altitude_ft > 0)
+    {
+        if (nowEpoch >= s.actual_off_epoch && s.actual_off_epoch > 0)
+        {
+            const unsigned long secs  = nowEpoch - s.actual_off_epoch;
+            const unsigned long tmins = secs / 60;
+            const unsigned long th    = tmins / 60;
+            const unsigned long tm    = tmins % 60;
+            char tBuf[16];
+            if      (th == 0)  snprintf(tBuf, sizeof(tBuf), "%dm",    (int)tmins);
+            else if (th >= 10) snprintf(tBuf, sizeof(tBuf), "%dh",    (int)th);
+            else               snprintf(tBuf, sizeof(tBuf), "%dh%dm", (int)th, (int)tm);
+            line2 = tBuf;
+        }
+        char altBuf[10];
+        snprintf(altBuf, sizeof(altBuf), "%.1fk", s.altitude_ft / 1000.0f);
+        if (line2.length() > 0) line2 += ' ';
+        line2 += altBuf;
+        if (hasPos)
+        {
+            const double distKm = haversineKm(
+                UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+                s.lat, s.lon);
+            char distBuf[10];
+            snprintf(distBuf, sizeof(distBuf), " %dmi", (int)((distKm * 0.621371) + 0.5));
+            line2 += distBuf;
+        }
+    }
+    else
+        line2 = isLanded ? "Landed" : (isAirborne ? "Airborne (alt=0)" : "On Ground");
+    Serial.print(F("  Line2: "));  Serial.println(line2);
+
+    // Line 3
+    String line3;
+    if (s.city.length() > 0 && s.region.length() > 0)
+        { line3 = s.city; line3 += ' '; line3 += s.region; }
+    else if (s.city.length() > 0)
+        line3 = s.city;
+    else if (s.region.length() > 0)
+        line3 = s.region;
+    else
+        line3 = "---";
+    Serial.print(F("  Line3: "));  Serial.println(line3);
+
+    Serial.println(F("==="));
+    Serial.println(F(""));
 }
 
 // Nearby redraw is synchronised to the user-configured cycle time so a long fetch
@@ -743,7 +854,6 @@ void loop()
     else if (g_appMode == MODE_TAIL_TRACKER)
     {
         // --- OpenSky position update (every 30 s) ---
-        // Runs once a valid AeroAPI enrichment has populated an initial position.
         // Clear cached ICAO24 when the tracked tail number changes (e.g. SerialConfig edit).
         {
             static String s_lastPositionTail;
@@ -754,15 +864,28 @@ void loop()
             }
         }
 
+        // Bootstrap ICAO24 from N-number (no network call) so the position timer
+        // can use findAircraftByIcao24 from the very first poll, even before AeroAPI
+        // has returned a position.
+        if (g_cachedTailIcao24.length() == 0)
+        {
+            char icaoHex[7];
+            if (TailTrackerFetcher::nNumberToIcao24(SerialConfig::tailNumber, icaoHex))
+                g_cachedTailIcao24 = String(icaoHex);
+        }
+
         const unsigned long posIntervalMs =
             TailTrackerConfiguration::POSITION_FETCH_INTERVAL_SECONDS * 1000UL;
 
+        // Fire when a direct ICAO24 lookup is possible (no lat/lon required) or
+        // when we already have a known position to centre a callsign search on.
         if (g_tailStatus.valid
-            && !isnan(g_tailStatus.lat) && !isnan(g_tailStatus.lon)
-            && !(g_tailStatus.lat == 0.0 && g_tailStatus.lon == 0.0)
             && WiFi.status() == WL_CONNECTED
             && (g_lastTailPositionFetchMs == 0
-                || now - g_lastTailPositionFetchMs >= posIntervalMs))
+                || now - g_lastTailPositionFetchMs >= posIntervalMs)
+            && (g_cachedTailIcao24.length() > 0
+                || (!isnan(g_tailStatus.lat) && !isnan(g_tailStatus.lon)
+                    && !(g_tailStatus.lat == 0.0 && g_tailStatus.lon == 0.0))))
         {
             StateVector sv;
             bool found = false;
@@ -809,17 +932,13 @@ void loop()
                 if (sv.on_ground
                     && g_tailStatus.actual_off_epoch > 0
                     && g_tailStatus.actual_on_epoch == 0)
+                {
+                    TailTrackerFetcher::flagRouteNeedsRefresh();
                     g_lastTailFetchMs = 0;
+                }
 
                 tailTrackerRedrawIfDue(true);
-                Serial.print("TailPos: lat=");
-                Serial.print(g_tailStatus.lat, 4);
-                Serial.print(" lon=");
-                Serial.print(g_tailStatus.lon, 4);
-                Serial.print(" alt=");
-                Serial.print(g_tailStatus.altitude_ft);
-                Serial.print("ft on_ground=");
-                Serial.println(sv.on_ground ? "Y" : "N");
+                printTailDebug(sv.on_ground ? "OpenSky (on_ground)" : "OpenSky");
             }
 
             g_requestMode = MODE_COUNT;
@@ -879,32 +998,38 @@ void loop()
                 }
                 g_prevIsAirborne = newIsAirborne;
 
-                // AeroAPI's last_position is the final en-route fix, not the airport.
-                // When landing is confirmed and OpenSky already put us on the ground,
-                // keep that position so the display shows the correct airport distance.
-                if (newStatus.actual_on_epoch > 0
-                    && g_tailStatus.valid
+                // Preserve live position from the 30-second OpenSky timer.
+                // Two cases handled below:
+                // (a) Landed: lock to last known ground fix so compass / distance
+                //     shows the arrival airport rather than a stale en-route fix.
+                // (b) fetchStatus() returned no live position (NAN lat/lon) because
+                //     OpenSky was unavailable — keep whatever the 30-second timer
+                //     last wrote rather than overwriting with NAN.
+                if (g_tailStatus.valid
                     && !isnan(g_tailStatus.lat) && !isnan(g_tailStatus.lon)
                     && !(g_tailStatus.lat == 0.0 && g_tailStatus.lon == 0.0))
                 {
-                    newStatus.lat         = g_tailStatus.lat;
-                    newStatus.lon         = g_tailStatus.lon;
-                    newStatus.altitude_ft = 0;
-                    TailTrackerFetcher::updateStickyPosition(newStatus.lat, newStatus.lon, 0);
+                    if (newStatus.actual_on_epoch > 0)
+                    {
+                        newStatus.lat         = g_tailStatus.lat;
+                        newStatus.lon         = g_tailStatus.lon;
+                        newStatus.altitude_ft = 0;
+                        TailTrackerFetcher::updateStickyPosition(newStatus.lat, newStatus.lon, 0);
+                    }
+                    else if (isnan(newStatus.lat) || isnan(newStatus.lon)
+                             || (newStatus.lat == 0.0 && newStatus.lon == 0.0))
+                    {
+                        newStatus.lat         = g_tailStatus.lat;
+                        newStatus.lon         = g_tailStatus.lon;
+                        newStatus.altitude_ft = g_tailStatus.altitude_ft;
+                        if (newStatus.city.length()   == 0) newStatus.city   = g_tailStatus.city;
+                        if (newStatus.region.length() == 0) newStatus.region = g_tailStatus.region;
+                    }
                 }
 
                 g_tailStatus = newStatus;
                 tailTrackerRedrawIfDue(true);
-                Serial.print("TailTracker: status=");
-                Serial.print(g_tailStatus.status);
-                Serial.print(" progress=");
-                Serial.print(g_tailStatus.progress_percent);
-                Serial.print("% alt=");
-                Serial.print(g_tailStatus.altitude_ft);
-                Serial.print("ft city=");
-                Serial.print(g_tailStatus.city);
-                Serial.print(" ");
-                Serial.println(g_tailStatus.region);
+                printTailDebug("AeroAPI");
             }
             else
             {
