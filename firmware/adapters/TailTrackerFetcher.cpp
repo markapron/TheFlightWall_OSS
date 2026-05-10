@@ -898,13 +898,17 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
             }
         }
 
-        // Line 3 city/region: reverse-geocode AeroAPI position if used;
-        // otherwise fall back to cached origin/dest from AeroAPI route data.
+        // Line 3 city/region: prefer Nominatim reverse-geocode of airport coordinates
+        // when landed; fall back to AeroAPI-supplied strings only if coordinates unknown.
         if (usingAeroApi) {
             fetchReverseGeocode(s_aeroApiLat, s_aeroApiLon, result.city, result.region);
         } else if (result.actual_on_epoch > 0) {
-            result.city   = s_cachedDestCity;
-            result.region = s_cachedDestRegion;
+            if (hasPlausibleLatLon(s_cachedDestLat, s_cachedDestLon))
+                fetchReverseGeocode(s_cachedDestLat, s_cachedDestLon, result.city, result.region);
+            else {
+                result.city   = s_cachedDestCity;
+                result.region = s_cachedDestRegion;
+            }
         } else if (result.actual_off_epoch == 0) {
             result.city   = s_cachedOriginCity;
             result.region = s_cachedOriginRegion;
@@ -1161,7 +1165,7 @@ static void printAeroApiCostBlock(const char *label, uint16_t routeCalls, uint16
     }
     if (routeCalls == 0 && posCalls == 0)
         Serial.println(F("   (no calls)"));
-    Serial.print(F("                          TOTAL        $"));
+    Serial.print(F("                          TOTAL           $"));
     snprintf(cbuf, sizeof(cbuf), "%u.%03u", (unsigned)(totalMd/1000u), (unsigned)(totalMd%1000u));
     Serial.println(cbuf);
 }
