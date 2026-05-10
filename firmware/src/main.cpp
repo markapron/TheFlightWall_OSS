@@ -749,7 +749,8 @@ void loop()
             TailFlightStatus newStatus;
             g_requestMode = MODE_TAIL_TRACKER;
             const bool fetchOk = g_tailFetcher.fetchStatus(
-                    SerialConfig::tailNumber.c_str(), newStatus);
+                    SerialConfig::tailNumber.c_str(), newStatus,
+                    SerialConfig::trackedIcao24);
             g_requestMode = MODE_COUNT;
             if (g_appMode != MODE_TAIL_TRACKER)
             {

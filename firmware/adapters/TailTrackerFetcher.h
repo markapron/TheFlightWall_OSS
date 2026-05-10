@@ -28,8 +28,12 @@ public:
     explicit TailTrackerFetcher(OpenSkyFetcher *openSky);
 
     // Populate `out` with the most recent flight data for `ident`.
+    // icao24Override: 6-char hex string that bypasses the N-number formula (pass ""
+    // to derive from formula as normal).  Use this for aircraft whose FAA-assigned
+    // ICAO24 doesn't match the computed formula value.
     // Returns true on success; `out` is left unchanged on failure.
-    bool fetchStatus(const String &ident, TailFlightStatus &out);
+    bool fetchStatus(const String &ident, TailFlightStatus &out,
+                     const String &icao24Override = "");
 
 private:
     OpenSkyFetcher *_openSky;

@@ -484,7 +484,8 @@ bool TailTrackerFetcher::fetchRouteFromAeroAPI(const String &ident)
 // fetchStatus — main public entry point
 // ---------------------------------------------------------------------------
 
-bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
+bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
+                                     const String &icao24Override)
 {
     const unsigned long nowMs = millis();
 
@@ -503,12 +504,21 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out)
         Serial.println(ident);
     }
 
-    // --- Compute ICAO24 from N-number (US aircraft; instant, no API call) ---
-    if (s_cachedIcao24.length() == 0) {
+    // --- Resolve ICAO24 ---
+    // Explicit override (from config) takes priority over the N-number formula.
+    // The formula works for most US registrations but the FAA does not strictly
+    // follow it for all aircraft (e.g. older or re-registered tail numbers).
+    if (icao24Override.length() > 0) {
+        if (s_cachedIcao24 != icao24Override) {
+            s_cachedIcao24 = icao24Override;
+            Serial.print(F("TailTracker: ICAO24 override="));
+            Serial.println(s_cachedIcao24);
+        }
+    } else if (s_cachedIcao24.length() == 0) {
         char hex[7];
         if (nNumberToIcao24(ident, hex)) {
             s_cachedIcao24 = String(hex);
-            Serial.print(F("TailTracker: ICAO24="));
+            Serial.print(F("TailTracker: ICAO24 (formula)="));
             Serial.println(s_cachedIcao24);
         }
     }
