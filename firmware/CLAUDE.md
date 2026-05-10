@@ -22,6 +22,10 @@ GET /states/all                 1 credit/result
 
 Built with **PlatformIO**. No separate install step — dependencies are declared in `platformio.ini` and fetched automatically.
 
+Use this command format to build to verify
+S
+cd "E:\ws\TheFlightWall_OSS\firmware"; & "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e adafruit_matrix_portal_m4 2>&1
+
 ```bash
 # Matrix Portal M4 (primary target)
 pio run -e adafruit_matrix_portal_m4 --target upload

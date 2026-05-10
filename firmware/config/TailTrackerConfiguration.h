@@ -23,5 +23,25 @@ namespace TailTrackerConfiguration
 
     // Reverse-geocode cache threshold: only re-query Nominatim when the
     // aircraft has moved more than this distance since the last geocode (km).
-    static const double GEO_CACHE_THRESHOLD_KM = 50.0;
+    static const double GEO_CACHE_THRESHOLD_KM = 10.0;
+
+    // AeroAPI position fallback: minimum interval between GET /flights/{id}/position
+    // calls when OpenSky cannot locate the aircraft. Only fires when the aircraft is
+    // believed to be airborne. Verify per-call cost before extending to production.
+    static const unsigned long AEROAPI_POSITION_FALLBACK_INTERVAL_MS = 2UL * 60UL * 1000UL;
+
+    // When OpenSky is rate-limited and the aircraft is on the ground, still call
+    // AeroAPI /position to detect takeoffs. Slower rate than the airborne fallback.
+    static const unsigned long AEROAPI_GROUND_FALLBACK_INTERVAL_MS = 10UL * 60UL * 1000UL;
+
+    // Telemetry-based landing/takeoff inference thresholds (helicopter-tuned).
+    // Infer landed when BOTH conditions hold for this many consecutive position polls.
+    static const int INFER_LAND_CONSECUTIVE = 2;
+    static const int INFER_LAND_ALT_FT      = 600;  // below 200 ft barometric
+    static const int INFER_LAND_SPEED_KT    = 30;   // below 25 kt
+
+    // Infer flying when BOTH conditions hold for this many consecutive polls.
+    static const int INFER_FLY_CONSECUTIVE  = 2;
+    static const int INFER_FLY_ALT_FT       = 600;  // above 400 ft
+    static const int INFER_FLY_SPEED_KT     = 60;   // above 20 kt
 }

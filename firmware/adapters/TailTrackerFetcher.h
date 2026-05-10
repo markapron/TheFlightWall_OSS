@@ -35,6 +35,10 @@ public:
     bool fetchStatus(const String &ident, TailFlightStatus &out,
                      const String &icao24Override = "");
 
+    void printPollSummary(const TailFlightStatus &st, uint16_t tallyCount,
+                          bool aeroApiCalledThisPoll);
+    static void resetCostWindow(unsigned long newEasternEpochDay);
+
 private:
     OpenSkyFetcher *_openSky;
 
@@ -53,6 +57,12 @@ private:
     // Fetch route metadata (origin, destination, timestamps) from AeroAPI.
     // Updates the static route cache and returns true on success.
     bool fetchRouteFromAeroAPI(const String &ident);
+
+    // Fetch current aircraft position from AeroAPI GET /flights/{faFlightId}/position.
+    // Used as a fallback when OpenSky cannot locate the aircraft. Throttled by
+    // TailTrackerConfiguration::AEROAPI_POSITION_FALLBACK_INTERVAL_MS. Only called
+    // when the aircraft is believed to be airborne.
+    bool fetchPositionFromAeroAPI(const String &faFlightId);
 
     // Nominatim helpers (identical to original implementation).
     bool fetchReverseGeocode(double lat, double lon,

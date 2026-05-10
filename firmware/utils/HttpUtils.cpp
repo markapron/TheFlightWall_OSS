@@ -24,7 +24,9 @@ static inline bool shouldAbort()
 
 bool wifiClientRequest(const String &method, const String &host, uint16_t port,
                        const String &path, const String &extraHeaders,
-                       const String &body, int &outCode, String &outPayload)
+                       const String &body, int &outCode, String &outPayload,
+                       String *outRateLimitRemaining,
+                       String *outRetryAfterSeconds)
 {
     outCode = -1;
     flightwallStringDrop(outPayload);
@@ -136,6 +138,18 @@ bool wifiClientRequest(const String &method, const String &host, uint16_t port,
         {
             isChunked = true;
             Serial.println("wifiClientRequest: chunked transfer encoding detected");
+        }
+        // Capture rate-limit headers for callers that need them (values are numeric,
+        // so lowercased line is fine for extraction).
+        if (outRateLimitRemaining && headerLine.startsWith("x-rate-limit-remaining:"))
+        {
+            *outRateLimitRemaining = headerLine.substring(strlen("x-rate-limit-remaining:"));
+            outRateLimitRemaining->trim();
+        }
+        if (outRetryAfterSeconds && headerLine.startsWith("x-rate-limit-retry-after-seconds:"))
+        {
+            *outRetryAfterSeconds = headerLine.substring(strlen("x-rate-limit-retry-after-seconds:"));
+            outRetryAfterSeconds->trim();
         }
     }
     flightwallStringDrop(headerLine);

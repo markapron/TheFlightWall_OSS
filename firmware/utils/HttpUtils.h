@@ -31,7 +31,9 @@ extern WifiClientAbortFn wifiClientShouldAbort;
 #if !defined(ARDUINO_ARCH_ESP32)
 bool wifiClientRequest(const String &method, const String &host, uint16_t port,
                        const String &path, const String &extraHeaders,
-                       const String &body, int &outCode, String &outPayload);
+                       const String &body, int &outCode, String &outPayload,
+                       String *outRateLimitRemaining = nullptr,
+                       String *outRetryAfterSeconds  = nullptr);
 
 // Streaming variant for large response bodies. The callback is invoked with body
 // bytes after transfer-encoding decoding (if chunked). Return false from the

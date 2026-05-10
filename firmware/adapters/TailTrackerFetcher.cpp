@@ -74,6 +74,29 @@ static int           s_stickyAlt = 0;
 // Was the aircraft airborne on the previous successful OpenSky poll?
 static bool          s_wasAirborne = false;
 
+// fa_flight_id from AeroAPI route fetch (needed for /position endpoint).
+static String        s_cachedFaFlightId;
+
+// Last aircraft position obtained from AeroAPI GET /flights/{id}/position.
+static double        s_aeroApiLat           = NAN;
+static double        s_aeroApiLon           = NAN;
+static int           s_aeroApiAltFt         = 0;
+static int           s_aeroApiSpeedKt       = -1;  // -1 = unknown
+static bool          s_aeroApiPosValid      = false;
+static unsigned long s_lastAeroApiPosFetchMs = 0;
+
+// Telemetry-based landing/takeoff inference state.
+static int           s_inferLandCount    = 0;  // consecutive polls with low alt+speed
+static int           s_inferFlyCount     = 0;  // consecutive polls with high alt+speed
+static bool          s_telemetryOnGround = false;
+
+// AeroAPI cost tracking — reset daily with the tally counter.
+static uint16_t      s_costRouteCalls     = 0; // GET /flights/{ident}   today
+static uint16_t      s_costPosCalls       = 0; // GET /flights/{id}/pos  today
+static uint16_t      s_prevCostRouteCalls = 0; // GET /flights/{ident}   yesterday
+static uint16_t      s_prevCostPosCalls   = 0; // GET /flights/{id}/pos  yesterday
+static uint32_t      s_pollCount          = 0; // total fetchStatus calls (never reset)
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -201,6 +224,53 @@ static void appendUrlQueryEncoded(const String &s, String &out)
             snprintf(buf, sizeof(buf), "%%%02X", (unsigned)c);
             out += buf;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry-based landing/takeoff inference
+// ---------------------------------------------------------------------------
+// Updates the consecutive-poll counters and flips s_telemetryOnGround when
+// thresholds are met. altFt and speedKt use -1 to mean "unknown"; unknown
+// values don't advance either counter so inference stays neutral.
+
+static void updateTelemetryInference(int altFt, int speedKt)
+{
+    using namespace TailTrackerConfiguration;
+    const bool altKnown   = (altFt   >= 0);
+    const bool speedKnown = (speedKt >= 0);
+
+    const bool lowAlt    = altKnown   && altFt   < INFER_LAND_ALT_FT;
+    const bool lowSpeed  = speedKnown && speedKt < INFER_LAND_SPEED_KT;
+    const bool highAlt   = altKnown   && altFt   >= INFER_FLY_ALT_FT;
+    const bool highSpeed = speedKnown && speedKt >= INFER_FLY_SPEED_KT;
+
+    if (lowAlt && lowSpeed) {
+        ++s_inferLandCount;
+        s_inferFlyCount = 0;
+    } else if (highAlt && highSpeed) {
+        ++s_inferFlyCount;
+        s_inferLandCount = 0;
+    } else {
+        s_inferLandCount = 0;
+        s_inferFlyCount  = 0;
+    }
+
+    if (s_inferLandCount >= INFER_LAND_CONSECUTIVE && !s_telemetryOnGround) {
+        s_telemetryOnGround = true;
+        Serial.print(F("TailTracker: telemetry inference -> LANDED (alt="));
+        Serial.print(altFt);
+        Serial.print(F("ft spd="));
+        Serial.print(speedKt);
+        Serial.println(F("kt)"));
+    }
+    if (s_inferFlyCount >= INFER_FLY_CONSECUTIVE && s_telemetryOnGround) {
+        s_telemetryOnGround = false;
+        Serial.print(F("TailTracker: telemetry inference -> FLYING (alt="));
+        Serial.print(altFt);
+        Serial.print(F("ft spd="));
+        Serial.print(speedKt);
+        Serial.println(F("kt)"));
     }
 }
 
@@ -386,7 +456,8 @@ bool TailTrackerFetcher::fetchRouteFromAeroAPI(const String &ident)
     JsonObject f = flights[bestIdx].as<JsonObject>();
 
     // Cache extracted data.
-    s_cachedIdent  = safeStr(f, "ident");
+    s_cachedFaFlightId = safeStr(f, "fa_flight_id");
+    s_cachedIdent      = safeStr(f, "ident");
     s_cachedStatus = safeStr(f, "status");
     if (s_cachedStatus == "Arrived")                  s_cachedStatus = "Landed";
     if (s_cachedStatus.startsWith("En Route"))        s_cachedStatus = "Flying";
@@ -477,6 +548,122 @@ bool TailTrackerFetcher::fetchRouteFromAeroAPI(const String &ident)
         }
     }
 
+    ++s_costRouteCalls;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// fetchPositionFromAeroAPI — lightweight position-only AeroAPI call
+// ---------------------------------------------------------------------------
+
+bool TailTrackerFetcher::fetchPositionFromAeroAPI(const String &faFlightId)
+{
+    if (strlen(APIConfiguration::AEROAPI_KEY) == 0 || faFlightId.length() == 0)
+        return false;
+
+    const String url = String(APIConfiguration::AEROAPI_BASE_URL)
+                     + "/flights/" + faFlightId + "/position";
+    bool https = true;
+    String host;
+    uint16_t port = 443;
+    String path;
+    if (!parseUrl(url, https, host, port, path)) {
+        Serial.println(F("TailTrackerFetcher: Failed to parse AeroAPI position URL"));
+        return false;
+    }
+#if defined(FLIGHTWALL_SKIP_TLS)
+    https = false; port = 80;
+#else
+    if (!https) { Serial.println(F("TailTrackerFetcher: Refusing non-HTTPS URL")); return false; }
+#endif
+
+    int    code = -1;
+    String payload;
+
+#if defined(ARDUINO_ARCH_ESP32)
+    {
+        TailTlsClient net;
+#if !defined(FLIGHTWALL_SKIP_TLS)
+        if (APIConfiguration::AEROAPI_INSECURE_TLS) net.setInsecure();
+#endif
+        HttpClient http(net, host.c_str(), port);
+        http.setHttpResponseTimeout(30000);
+        http.beginRequest();
+        http.get(path);
+        http.sendHeader("x-apikey", APIConfiguration::AEROAPI_KEY);
+        http.sendHeader("Accept",   "application/json");
+        http.endRequest();
+        code    = http.responseStatusCode();
+        payload = http.responseBody();
+    }
+#else
+    {
+        const String hdrs = String("x-apikey: ") + APIConfiguration::AEROAPI_KEY
+                          + "\r\nAccept: application/json\r\n";
+        if (!wifiClientRequest("GET", host, port, path, hdrs, "", code, payload)) {
+            Serial.println(F("TailTrackerFetcher: AeroAPI /position request failed"));
+            s_lastAeroApiPosFetchMs = millis(); // advance throttle even on transport failure
+            return false;
+        }
+    }
+#endif
+
+    s_lastAeroApiPosFetchMs = millis(); // advance throttle regardless of HTTP outcome
+
+    if (code != 200) {
+        Serial.print(F("TailTracker: AeroAPI /position HTTP "));
+        Serial.println(code);
+        flightwallStringDrop(payload);
+        return false;
+    }
+
+    JsonDocument filter;
+    filter["last_position"]["latitude"]    = true;
+    filter["last_position"]["longitude"]   = true;
+    filter["last_position"]["altitude"]    = true;
+    filter["last_position"]["groundspeed"] = true;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload,
+                                               DeserializationOption::Filter(filter));
+    flightwallStringDrop(payload);
+    if (err) {
+        Serial.print(F("TailTrackerFetcher: /position JSON error: "));
+        Serial.println(err.c_str());
+        return false;
+    }
+
+    if (doc["last_position"].isNull()) {
+        Serial.println(F("TailTracker: AeroAPI /position: no last_position in response"));
+        return false;
+    }
+    JsonObject lp = doc["last_position"].as<JsonObject>();
+
+    double lpLat = NAN, lpLon = NAN;
+    if (!lp["latitude"].isNull())  lpLat = lp["latitude"].as<double>();
+    if (!lp["longitude"].isNull()) lpLon = lp["longitude"].as<double>();
+    if (!hasPlausibleLatLon(lpLat, lpLon)) {
+        Serial.println(F("TailTracker: AeroAPI /position: implausible coordinates"));
+        return false;
+    }
+
+    s_aeroApiLat      = lpLat;
+    s_aeroApiLon      = lpLon;
+    // altitude field in AeroAPI last_position is in feet
+    s_aeroApiAltFt    = lp["altitude"].isNull()    ? 0  : lp["altitude"].as<int>();
+    s_aeroApiSpeedKt  = lp["groundspeed"].isNull() ? -1 : lp["groundspeed"].as<int>();
+    s_aeroApiPosValid = true;
+    ++s_costPosCalls;
+
+    Serial.print(F("TailTracker: AeroAPI pos fallback "));
+    Serial.print(lpLat, 4);
+    Serial.print(',');
+    Serial.print(lpLon, 4);
+    Serial.print(F(" alt="));
+    Serial.print(s_aeroApiAltFt);
+    Serial.print(F("ft spd="));
+    Serial.print(s_aeroApiSpeedKt);
+    Serial.println(F("kt"));
     return true;
 }
 
@@ -496,10 +683,20 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
         s_routeNeedsRefresh = true;
         s_routeFetchMs      = 0;
         s_cachedIcao24      = "";
-        s_stickyLat         = NAN;
-        s_stickyLon         = NAN;
-        s_stickyAlt         = 0;
-        s_wasAirborne       = false;
+        s_stickyLat              = NAN;
+        s_stickyLon              = NAN;
+        s_stickyAlt              = 0;
+        s_wasAirborne            = false;
+        s_cachedFaFlightId       = "";
+        s_aeroApiLat             = NAN;
+        s_aeroApiLon             = NAN;
+        s_aeroApiAltFt           = 0;
+        s_aeroApiSpeedKt         = -1;
+        s_aeroApiPosValid        = false;
+        s_lastAeroApiPosFetchMs  = 0;
+        s_inferLandCount         = 0;
+        s_inferFlyCount          = 0;
+        s_telemetryOnGround      = false;
         Serial.print(F("TailTracker: tracking new ident "));
         Serial.println(ident);
     }
@@ -567,11 +764,12 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
         if (_openSky->fetchByIcao24(s_cachedIcao24, sv)
                 && hasPlausibleLatLon(sv.lat, sv.lon)) {
 
-            result.lat         = sv.lat;
-            result.lon         = sv.lon;
-            result.altitude_ft = isnan(sv.baro_altitude) ? 0
-                               : (int)(sv.baro_altitude * 3.28084f);
-            gotPosition = true;
+            result.lat            = sv.lat;
+            result.lon            = sv.lon;
+            result.altitude_ft    = isnan(sv.baro_altitude) ? 0
+                                  : (int)(sv.baro_altitude * 3.28084f);
+            gotPosition           = true;
+            result.positionSource = TailPositionSource::OpenSky;
 
             // Compute geometric progress from cached origin/dest coordinates.
             if (hasPlausibleLatLon(s_cachedOriginLat, s_cachedOriginLon) &&
@@ -609,10 +807,32 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
             if (result.progress_percent == 100 && sv.on_ground)
                 result.status = "Landed";
 
+            // Telemetry inference overrides when primary sources are ambiguous.
+            if (s_telemetryOnGround && result.status == "Flying") {
+                result.status = "Landed";
+                if (!s_routeNeedsRefresh) {
+                    s_routeNeedsRefresh = true;
+                    Serial.println(F("TailTracker: telemetry inference triggered route refresh"));
+                }
+            } else if (!s_telemetryOnGround && result.status == "Landed"
+                       && result.actual_on_epoch == 0) {
+                result.status = "Flying";
+                s_wasAirborne = true;
+            }
+
             // Update sticky position.
             s_stickyLat = sv.lat;
             s_stickyLon = sv.lon;
             s_stickyAlt = result.altitude_ft;
+
+            // Update telemetry inference with OpenSky speed (m/s → kt).
+            {
+                const int altFt   = isnan(sv.baro_altitude) ? -1
+                                  : (int)(sv.baro_altitude * 3.28084f);
+                const int speedKt = isnan(sv.velocity) ? -1
+                                  : (int)(sv.velocity * 1.944f);
+                updateTelemetryInference(altFt, speedKt);
+            }
 
             // Reverse-geocode current location.
             fetchReverseGeocode(sv.lat, sv.lon, result.city, result.region);
@@ -626,31 +846,63 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
         Serial.println(F("TailTracker: ICAO24 unknown — OpenSky position unavailable"));
     }
 
-    // --- Fall back to sticky position when OpenSky had no data ---
+    // --- No OpenSky position: try AeroAPI fallback, then sticky ---
     if (!gotPosition) {
-        if (hasPlausibleLatLon(s_stickyLat, s_stickyLon)) {
-            result.lat         = s_stickyLat;
-            result.lon         = s_stickyLon;
-            result.altitude_ft = s_stickyAlt;
+        const bool believedAirborne = (s_wasAirborne || s_cachedStatus == "Flying");
+        const bool openSkyThrottled = OpenSkyFetcher::isRateLimited();
+        const bool fallbackAllowed  = believedAirborne || openSkyThrottled;
+        const unsigned long fallbackInterval = believedAirborne
+            ? TailTrackerConfiguration::AEROAPI_POSITION_FALLBACK_INTERVAL_MS
+            : TailTrackerConfiguration::AEROAPI_GROUND_FALLBACK_INTERVAL_MS;
+        const bool fallbackDue = fallbackAllowed && s_cachedFaFlightId.length() > 0 &&
+            (s_lastAeroApiPosFetchMs == 0 ||
+             nowMs - s_lastAeroApiPosFetchMs >= fallbackInterval);
 
-            if (hasPlausibleLatLon(s_cachedOriginLat, s_cachedOriginLon) &&
-                hasPlausibleLatLon(s_cachedDestLat,   s_cachedDestLon))
-            {
-                const double total = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
-                                                 s_cachedDestLat,   s_cachedDestLon);
-                if (total > 10.0) {
-                    const double traveled = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
-                                                        s_stickyLat, s_stickyLon);
-                    int prog = (int)lround((traveled * 100.0) / total);
-                    if (prog < 0)   prog = 0;
-                    if (prog > 100) prog = 100;
-                    result.progress_percent = prog;
-                }
+        if (fallbackDue) {
+            Serial.println(F("TailTracker: OpenSky miss — trying AeroAPI position fallback"));
+            fetchPositionFromAeroAPI(s_cachedFaFlightId);
+        }
+
+        // Position priority: AeroAPI last_position > sticky (last good OpenSky reading).
+        bool usingAeroApi = false;
+        if (s_aeroApiPosValid && hasPlausibleLatLon(s_aeroApiLat, s_aeroApiLon)) {
+            result.lat            = s_aeroApiLat;
+            result.lon            = s_aeroApiLon;
+            result.altitude_ft    = s_aeroApiAltFt;
+            result.positionSource = TailPositionSource::AeroApi;
+            usingAeroApi          = true;
+            // Feed inference from AeroAPI telemetry when it was just refreshed.
+            if (fallbackDue)
+                updateTelemetryInference(s_aeroApiAltFt, s_aeroApiSpeedKt);
+        } else if (hasPlausibleLatLon(s_stickyLat, s_stickyLon)) {
+            result.lat            = s_stickyLat;
+            result.lon            = s_stickyLon;
+            result.altitude_ft    = s_stickyAlt;
+            result.positionSource = TailPositionSource::Sticky;
+        }
+
+        // Compute geometric progress from whichever position we have.
+        if (hasPlausibleLatLon(result.lat, result.lon) &&
+            hasPlausibleLatLon(s_cachedOriginLat, s_cachedOriginLon) &&
+            hasPlausibleLatLon(s_cachedDestLat,   s_cachedDestLon))
+        {
+            const double total = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
+                                             s_cachedDestLat,   s_cachedDestLon);
+            if (total > 10.0) {
+                const double traveled = haversineKm(s_cachedOriginLat, s_cachedOriginLon,
+                                                    result.lat, result.lon);
+                int prog = (int)lround((traveled * 100.0) / total);
+                if (prog < 0)   prog = 0;
+                if (prog > 100) prog = 100;
+                result.progress_percent = prog;
             }
         }
 
-        // Use city/region from cached AeroAPI data.
-        if (result.actual_on_epoch > 0) {
+        // Line 3 city/region: reverse-geocode AeroAPI position if used;
+        // otherwise fall back to cached origin/dest from AeroAPI route data.
+        if (usingAeroApi) {
+            fetchReverseGeocode(s_aeroApiLat, s_aeroApiLon, result.city, result.region);
+        } else if (result.actual_on_epoch > 0) {
             result.city   = s_cachedDestCity;
             result.region = s_cachedDestRegion;
         } else if (result.actual_off_epoch == 0) {
@@ -871,4 +1123,175 @@ const char *TailTrackerFetcher::usStateAbbrev(const char *fullName)
         if (strcmp(fullName, e.full) == 0) return e.abbr;
     }
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// resetCostWindow — called from main.cpp at Eastern midnight (tally reset)
+// ---------------------------------------------------------------------------
+
+void TailTrackerFetcher::resetCostWindow(unsigned long /*newEasternEpochDay*/)
+{
+    s_prevCostRouteCalls = s_costRouteCalls;
+    s_prevCostPosCalls   = s_costPosCalls;
+    s_costRouteCalls     = 0;
+    s_costPosCalls       = 0;
+    Serial.println(F("TailTracker: AeroAPI cost window reset (new Eastern day)"));
+}
+
+// ---------------------------------------------------------------------------
+// printPollSummary — structured serial status block
+// ---------------------------------------------------------------------------
+
+static void printAeroApiCostBlock(const char *label, uint16_t routeCalls, uint16_t posCalls)
+{
+    const uint32_t totalMd = (uint32_t)routeCalls * 5u + (uint32_t)posCalls * 10u;
+    char cbuf[8];
+    Serial.print(F(" AEROAPI SPEND  ")); Serial.println(label);
+    if (routeCalls > 0) {
+        Serial.print(F("   /flights/{ident}   "));
+        Serial.print(routeCalls); Serial.print(F(" calls  x $0.005 = $"));
+        snprintf(cbuf, sizeof(cbuf), "%u.%03u", (routeCalls*5u)/1000u, (routeCalls*5u)%1000u);
+        Serial.println(cbuf);
+    }
+    if (posCalls > 0) {
+        Serial.print(F("   /flights/{id}/pos  "));
+        Serial.print(posCalls); Serial.print(F(" calls  x $0.010 = $"));
+        snprintf(cbuf, sizeof(cbuf), "%u.%03u", (posCalls*10u)/1000u, (posCalls*10u)%1000u);
+        Serial.println(cbuf);
+    }
+    if (routeCalls == 0 && posCalls == 0)
+        Serial.println(F("   (no calls)"));
+    Serial.print(F("                          TOTAL        $"));
+    snprintf(cbuf, sizeof(cbuf), "%u.%03u", (unsigned)(totalMd/1000u), (unsigned)(totalMd%1000u));
+    Serial.println(cbuf);
+}
+
+void TailTrackerFetcher::printPollSummary(const TailFlightStatus &st,
+                                          uint16_t tallyCount,
+                                          bool aeroApiCalledThisPoll)
+{
+    ++s_pollCount;
+    const bool rlActive = OpenSkyFetcher::isRateLimited();
+    const int  rlRemain = OpenSkyFetcher::getRateLimitRemaining();
+
+    Serial.println(F("============================================================"));
+    Serial.print(F(" TailTracker Poll #")); Serial.print(s_pollCount);
+    if (st.fetch_epoch > 0) {
+        const uint8_t hh = (st.fetch_epoch % 86400UL) / 3600UL;
+        const uint8_t mm = (st.fetch_epoch % 3600UL)  / 60UL;
+        const uint8_t ss =  st.fetch_epoch % 60UL;
+        char tbuf[16];
+        snprintf(tbuf, sizeof(tbuf), "  %02u:%02u:%02u UTC", hh, mm, ss);
+        Serial.print(tbuf);
+    }
+    Serial.println();
+    Serial.println(F("============================================================"));
+
+    // Aircraft block
+    Serial.print(F(" AIRCRAFT  ")); Serial.print(st.ident);
+    if (s_cachedFaFlightId.length() > 0) {
+        Serial.print(F("   fa=")); Serial.print(s_cachedFaFlightId);
+    }
+    if (s_cachedIcao24.length() > 0) {
+        Serial.print(F("   ICAO24: ")); Serial.print(s_cachedIcao24);
+    }
+    Serial.println();
+
+    Serial.print(F(" STATUS    ")); Serial.print(st.status);
+    Serial.print(F("   TALLY: ")); Serial.print(tallyCount); Serial.println(F(" today"));
+
+    if (st.origin_code.length() > 0 && st.dest_code.length() > 0) {
+        Serial.print(F(" ROUTE     ")); Serial.print(st.origin_code);
+        Serial.print(F(" -> ")); Serial.print(st.dest_code);
+        Serial.print(F("   ")); Serial.print(st.progress_percent); Serial.println(F("% complete"));
+    }
+
+    if (!isnan(st.lat) && !isnan(st.lon)) {
+        char posBuf[36];
+        snprintf(posBuf, sizeof(posBuf), " POSITION  %.4f, %.4f",
+                 (double)st.lat, (double)st.lon);
+        Serial.println(posBuf);
+    }
+
+    if (st.altitude_ft > 0 || st.positionSource != TailPositionSource::None) {
+        Serial.print(F(" ALT/SPD   "));
+        Serial.print(st.altitude_ft); Serial.print(F(" ft  /  "));
+        if (s_aeroApiSpeedKt >= 0 && st.positionSource == TailPositionSource::AeroApi)
+            { Serial.print(s_aeroApiSpeedKt); Serial.println(F(" kt")); }
+        else
+            Serial.println(F("-- kt"));
+    }
+
+    if (st.city.length() > 0) {
+        Serial.print(F(" LOCATION  ")); Serial.print(st.city);
+        if (st.region.length() > 0) { Serial.print(F(" ")); Serial.print(st.region); }
+        Serial.println();
+    }
+
+    // Data sources
+    Serial.println(F("------------------------------------------------------------"));
+    Serial.println(F(" DATA SOURCES"));
+    Serial.print(F("   Position : "));
+    switch (st.positionSource) {
+        case TailPositionSource::OpenSky:
+            Serial.println(F("OpenSky (live)"));
+            break;
+        case TailPositionSource::AeroApi:
+            if (rlActive)
+                Serial.println(F("AeroAPI /position (fallback, OpenSky throttled)"));
+            else
+                Serial.println(F("AeroAPI /position (airborne fallback, OpenSky miss)"));
+            break;
+        case TailPositionSource::Sticky:
+            Serial.println(F("Sticky (stale OpenSky)"));
+            break;
+        default:
+            Serial.println(F("None"));
+            break;
+    }
+
+    Serial.print(F("   Route    : AeroAPI cached "));
+    if (s_routeFetchMs > 0) {
+        const unsigned long ageS = (millis() - s_routeFetchMs) / 1000UL;
+        char agebuf[16];
+        snprintf(agebuf, sizeof(agebuf), "%uh %02um ago",
+                 (unsigned)(ageS / 3600UL), (unsigned)((ageS % 3600UL) / 60UL));
+        Serial.println(agebuf);
+    } else {
+        Serial.println(F("never"));
+    }
+
+    Serial.print(F("   Pos API  : "));
+    if (aeroApiCalledThisPoll)
+        Serial.println(F("called this poll"));
+    else if (!rlActive && st.positionSource == TailPositionSource::OpenSky)
+        Serial.println(F("not called (OpenSky OK)"));
+    else
+        Serial.println(F("skipped (interval)"));
+
+    // Rate limits
+    Serial.println(F("------------------------------------------------------------"));
+    Serial.println(F(" RATE LIMITS"));
+    Serial.print(F("   OpenSky  : "));
+    if (rlActive) {
+        const unsigned long resumeMs = OpenSkyFetcher::getRateLimitResumeMs();
+        const unsigned long nowMs    = millis();
+        const unsigned long secsLeft = (resumeMs > nowMs) ? (resumeMs - nowMs) / 1000UL : 0;
+        Serial.print(F("THROTTLED — resume in "));
+        Serial.print(secsLeft); Serial.println(F("s"));
+    } else {
+        Serial.print(F("OK"));
+        if (rlRemain >= 0) {
+            Serial.print(F("  (remaining: ")); Serial.print(rlRemain); Serial.print(F(" credits)"));
+        }
+        Serial.println();
+    }
+    Serial.println(F("   AeroAPI  : OK"));
+
+    // Cost
+    Serial.println(F("------------------------------------------------------------"));
+    printAeroApiCostBlock("today", s_costRouteCalls, s_costPosCalls);
+    if (s_prevCostRouteCalls > 0 || s_prevCostPosCalls > 0)
+        printAeroApiCostBlock("yesterday", s_prevCostRouteCalls, s_prevCostPosCalls);
+    Serial.println(F("============================================================"));
 }
