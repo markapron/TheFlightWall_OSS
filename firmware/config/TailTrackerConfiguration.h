@@ -32,7 +32,7 @@ namespace TailTrackerConfiguration
 
     // When OpenSky is rate-limited and the aircraft is on the ground, still call
     // AeroAPI /position to detect takeoffs. Slower rate than the airborne fallback.
-    static const unsigned long AEROAPI_GROUND_FALLBACK_INTERVAL_MS = 10UL * 60UL * 1000UL;
+    static const unsigned long AEROAPI_GROUND_FALLBACK_INTERVAL_MS = 60UL * 60UL * 1000UL;
 
     // Telemetry-based landing/takeoff inference thresholds (helicopter-tuned).
     // Infer landed when BOTH conditions hold for this many consecutive position polls.
