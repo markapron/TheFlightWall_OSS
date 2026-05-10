@@ -25,6 +25,10 @@ public:
 
     bool ensureAuthenticated(bool forceRefresh = false);
 
+    static bool isRateLimited();
+    static int getRateLimitRemaining();
+    static unsigned long getRateLimitResumeMs();
+
 private:
     String m_accessToken;
     unsigned long m_tokenExpiryMs = 0;

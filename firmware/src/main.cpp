@@ -749,7 +749,8 @@ void loop()
             TailFlightStatus newStatus;
             g_requestMode = MODE_TAIL_TRACKER;
             const bool fetchOk = g_tailFetcher.fetchStatus(
-                    SerialConfig::tailNumber.c_str(), newStatus);
+                    SerialConfig::tailNumber.c_str(), newStatus,
+                    SerialConfig::trackedIcao24);
             g_requestMode = MODE_COUNT;
             if (g_appMode != MODE_TAIL_TRACKER)
             {
@@ -775,6 +776,7 @@ void loop()
                     {
                         g_tallyCount        = 0;
                         g_tallyLastResetDay = easternDay;
+                        TailTrackerFetcher::resetCostWindow(easternDay);
                     }
                 }
 
@@ -789,16 +791,8 @@ void loop()
 
                 g_tailStatus = newStatus;
                 tailTrackerRedrawIfDue(true);
-                Serial.print("TailTracker: status=");
-                Serial.print(g_tailStatus.status);
-                Serial.print(" progress=");
-                Serial.print(g_tailStatus.progress_percent);
-                Serial.print("% alt=");
-                Serial.print(g_tailStatus.altitude_ft);
-                Serial.print("ft city=");
-                Serial.print(g_tailStatus.city);
-                Serial.print(" ");
-                Serial.println(g_tailStatus.region);
+                g_tailFetcher.printPollSummary(g_tailStatus, g_tallyCount,
+                    g_tailStatus.positionSource == TailPositionSource::AeroApi);
             }
             else
             {

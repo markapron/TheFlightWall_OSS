@@ -2,6 +2,13 @@
 
 #include <Arduino.h>
 
+enum class TailPositionSource : uint8_t {
+    None    = 0,
+    OpenSky = 1,
+    AeroApi = 2,
+    Sticky  = 3
+};
+
 struct TailFlightStatus
 {
     bool valid = false;
@@ -52,4 +59,6 @@ struct TailFlightStatus
     // without polling WiFi.getTime() on every frame.
     unsigned long fetch_epoch  = 0; // epoch at time of successful fetch
     unsigned long fetch_millis = 0; // millis() at time of successful fetch
+
+    TailPositionSource positionSource = TailPositionSource::None;
 };

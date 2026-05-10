@@ -43,6 +43,7 @@ namespace SerialConfig
     extern String   wifiSSID;
     extern String   wifiPassword;
     extern String   tailNumber;
+    extern String   trackedIcao24;    // 6-char hex override; empty = derive from N-number formula
     extern uint16_t tallyResetMinutes; // minutes from Eastern midnight, default 1080 (18:00)
 
     // Display brightness as a percentage (1–100).

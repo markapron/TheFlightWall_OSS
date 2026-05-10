@@ -28,8 +28,16 @@ public:
     explicit TailTrackerFetcher(OpenSkyFetcher *openSky);
 
     // Populate `out` with the most recent flight data for `ident`.
+    // icao24Override: 6-char hex string that bypasses the N-number formula (pass ""
+    // to derive from formula as normal).  Use this for aircraft whose FAA-assigned
+    // ICAO24 doesn't match the computed formula value.
     // Returns true on success; `out` is left unchanged on failure.
-    bool fetchStatus(const String &ident, TailFlightStatus &out);
+    bool fetchStatus(const String &ident, TailFlightStatus &out,
+                     const String &icao24Override = "");
+
+    void printPollSummary(const TailFlightStatus &st, uint16_t tallyCount,
+                          bool aeroApiCalledThisPoll);
+    static void resetCostWindow(unsigned long newEasternEpochDay);
 
 private:
     OpenSkyFetcher *_openSky;
@@ -49,6 +57,12 @@ private:
     // Fetch route metadata (origin, destination, timestamps) from AeroAPI.
     // Updates the static route cache and returns true on success.
     bool fetchRouteFromAeroAPI(const String &ident);
+
+    // Fetch current aircraft position from AeroAPI GET /flights/{faFlightId}/position.
+    // Used as a fallback when OpenSky cannot locate the aircraft. Throttled by
+    // TailTrackerConfiguration::AEROAPI_POSITION_FALLBACK_INTERVAL_MS. Only called
+    // when the aircraft is believed to be airborne.
+    bool fetchPositionFromAeroAPI(const String &faFlightId);
 
     // Nominatim helpers (identical to original implementation).
     bool fetchReverseGeocode(double lat, double lon,

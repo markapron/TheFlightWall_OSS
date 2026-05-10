@@ -28,6 +28,38 @@ Outputs: Populates outStateVectors with filtered results (distance_km, bearing_d
   #endif
 #endif
 
+// ---------------------------------------------------------------------------
+// Rate-limit state (shared across all OpenSkyFetcher instances)
+// ---------------------------------------------------------------------------
+static unsigned long s_rlResumeMs  = 0;  // millis() when backoff ends; 0 = not limited
+static int           s_rlRemaining = -1; // last reported X-Rate-Limit-Remaining (-1 = unknown)
+
+static void applyRateLimitHeaders(const String &remaining, const String &retryAfter, int code)
+{
+    if (remaining.length() > 0) {
+        s_rlRemaining = remaining.toInt();
+        Serial.print(F("OpenSky: rate-limit remaining="));
+        Serial.println(s_rlRemaining);
+    }
+    const long retrySecs = retryAfter.length() > 0 ? retryAfter.toInt() : 0;
+    if (retrySecs > 0) {
+        s_rlResumeMs = millis() + (unsigned long)retrySecs * 1000UL;
+        Serial.print(F("OpenSky: rate-limited — retry after "));
+        Serial.print(retrySecs);
+        Serial.println(F("s"));
+    }
+    if (code == 429 && retrySecs <= 0) {
+        s_rlResumeMs = millis() + 60000UL; // default 60 s backoff when no header
+        Serial.println(F("OpenSky: 429 with no Retry-After — backing off 60s"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+bool OpenSkyFetcher::isRateLimited()              { return millis() < s_rlResumeMs; }
+int  OpenSkyFetcher::getRateLimitRemaining()      { return s_rlRemaining; }
+unsigned long OpenSkyFetcher::getRateLimitResumeMs() { return s_rlResumeMs; }
+
 static String urlEncodeForm(const String &value)
 {
     String out;
@@ -258,8 +290,20 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
     }
 #endif
 
+    // Check rate-limit backoff before making any network call.
+    {
+        const unsigned long nowMs = millis();
+        if (nowMs < s_rlResumeMs) {
+            Serial.print(F("OpenSky: rate-limited, skipping states call (resume in "));
+            Serial.print((s_rlResumeMs - nowMs) / 1000UL);
+            Serial.println(F("s)"));
+            return false;
+        }
+    }
+
     int code = -1;
     String payload;
+    String rlRemaining, rlRetryAfter;
 
     // Helper that performs the states GET with the current access token.
     // Called once normally, then again after a 401 token refresh.
@@ -273,11 +317,14 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
         http.sendHeader("Authorization", String("Bearer ") + m_accessToken);
         http.endRequest();
         code = http.responseStatusCode();
+        rlRemaining  = http.header("X-Rate-Limit-Remaining");
+        rlRetryAfter = http.header("X-Rate-Limit-Retry-After-Seconds");
         payload = http.responseBody();
         return true;
 #else
         const String extraHeaders = String("Authorization: Bearer ") + m_accessToken + "\r\nAccept: application/json\r\n";
-        return wifiClientRequest("GET", host, port, path, extraHeaders, "", code, payload);
+        return wifiClientRequest("GET", host, port, path, extraHeaders, "", code, payload,
+                                 &rlRemaining, &rlRetryAfter);
 #endif
     };
 
@@ -287,21 +334,26 @@ bool OpenSkyFetcher::fetchStateVectors(double centerLat,
         return false;
     }
 
+    applyRateLimitHeaders(rlRemaining, rlRetryAfter, code);
+
     // 401: token may have expired — refresh and retry once
     if (code == 401 && m_accessToken.length() > 0 && ensureAccessToken(true))
     {
         flightwallStringDrop(payload);
+        rlRemaining = ""; rlRetryAfter = "";
         if (!doStatesGet())
         {
             Serial.println("OpenSkyFetcher: States GET retry failed after token refresh");
             return false;
         }
+        applyRateLimitHeaders(rlRemaining, rlRetryAfter, code);
     }
 
     if (code != 200)
     {
         Serial.print("OpenSkyFetcher: HTTP request failed with code: ");
         Serial.println(code);
+        flightwallStringDrop(payload);
         return false;
     }
 
@@ -417,8 +469,20 @@ bool OpenSkyFetcher::fetchByIcao24(const String &icao24Hex, StateVector &outStat
     }
 #endif
 
+    // Check rate-limit backoff before making any network call.
+    {
+        const unsigned long nowMs = millis();
+        if (nowMs < s_rlResumeMs) {
+            Serial.print(F("OpenSky: rate-limited, skipping icao24 call (resume in "));
+            Serial.print((s_rlResumeMs - nowMs) / 1000UL);
+            Serial.println(F("s)"));
+            return false;
+        }
+    }
+
     int code = -1;
     String payload;
+    String rlRemaining, rlRetryAfter;
 
     auto doGet = [&]() -> bool {
 #if defined(ARDUINO_ARCH_ESP32)
@@ -429,13 +493,16 @@ bool OpenSkyFetcher::fetchByIcao24(const String &icao24Hex, StateVector &outStat
         http.get(path);
         http.sendHeader("Authorization", String("Bearer ") + m_accessToken);
         http.endRequest();
-        code    = http.responseStatusCode();
-        payload = http.responseBody();
+        code         = http.responseStatusCode();
+        rlRemaining  = http.header("X-Rate-Limit-Remaining");
+        rlRetryAfter = http.header("X-Rate-Limit-Retry-After-Seconds");
+        payload      = http.responseBody();
         return true;
 #else
         const String extraHeaders = String("Authorization: Bearer ") + m_accessToken
                                   + "\r\nAccept: application/json\r\n";
-        return wifiClientRequest("GET", host, port, path, extraHeaders, "", code, payload);
+        return wifiClientRequest("GET", host, port, path, extraHeaders, "", code, payload,
+                                 &rlRemaining, &rlRetryAfter);
 #endif
     };
 
@@ -444,14 +511,18 @@ bool OpenSkyFetcher::fetchByIcao24(const String &icao24Hex, StateVector &outStat
         Serial.println("OpenSkyFetcher: icao24 GET failed");
         return false;
     }
+    applyRateLimitHeaders(rlRemaining, rlRetryAfter, code);
+
     if (code == 401 && ensureAccessToken(true))
     {
         flightwallStringDrop(payload);
+        rlRemaining = ""; rlRetryAfter = "";
         if (!doGet())
         {
             Serial.println("OpenSkyFetcher: icao24 GET retry failed");
             return false;
         }
+        applyRateLimitHeaders(rlRemaining, rlRetryAfter, code);
     }
     if (code != 200)
     {
