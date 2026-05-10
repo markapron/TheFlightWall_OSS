@@ -472,8 +472,14 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status, uint
     // --- Line 1: status + destination ---
     // Use += with char literals instead of temporary String("x") objects to
     // avoid repeated small heap allocations on every display tick.
+    const bool isKnownLanded = isLanded || status.status == "Landed";
     String statusLine;
-    if (isAirborne && status.dest_code.length() > 0)
+    if (isKnownLanded && status.dest_name.length() > 0)
+    {
+        // Airport name known — show it alone (no "Landed" prefix saves display space).
+        statusLine = status.dest_name;
+    }
+    else if (isAirborne && status.dest_code.length() > 0)
     {
         statusLine = "Flying to ";
         statusLine += status.dest_code;

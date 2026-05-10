@@ -51,6 +51,10 @@ struct TailFlightStatus
     // Shown on the status line when the flight has landed.
     String dest_code;
 
+    // Human-readable airport name from AirportNameCache (abbreviated).
+    // When non-empty and landed, displayed instead of dest_code + "Landed" prefix.
+    String dest_name;
+
     // Best available origin airport code (IATA preferred, then local ID).
     // Used for compass bearing fallback while on the ground / scheduled.
     String origin_code;
