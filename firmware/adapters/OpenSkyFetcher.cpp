@@ -445,7 +445,6 @@ bool OpenSkyFetcher::fetchByIcao24(const String &icao24Hex, StateVector &outStat
         return false;
     }
 
-    // Global query filtered by ICAO24 — no bbox needed; response is ≤1 entry.
     const String url = String(APIConfiguration::OPENSKY_BASE_URL)
                      + "/api/states/all?icao24=" + icao24Hex;
 
@@ -551,8 +550,20 @@ bool OpenSkyFetcher::fetchByIcao24(const String &icao24Hex, StateVector &outStat
         return false; // aircraft not currently transmitting / outside coverage
     }
 
-    JsonArray a = states[0].as<JsonArray>();
-    if (a.isNull() || a.size() < 17)
+    // Find the entry matching icao24Hex rather than blindly taking states[0].
+    // When a bbox is included in the URL, OpenSky may return multiple aircraft;
+    // accepting the first entry without validation would silently use the wrong aircraft.
+    JsonArray a;
+    for (JsonArray entry : states) {
+        if (!entry.isNull() && entry.size() >= 17) {
+            const char *id = entry[0].as<const char *>();
+            if (id && icao24Hex.equalsIgnoreCase(id)) {
+                a = entry;
+                break;
+            }
+        }
+    }
+    if (a.isNull())
     {
         doc.clear();
         return false;

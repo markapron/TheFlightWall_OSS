@@ -10,8 +10,12 @@ namespace TailTrackerConfiguration
     // numbers are both accepted.  Set the value in config/Secrets.h.
     static const char *TRACKED_TAIL_NUMBER = SECRET_TRACKED_TAIL_NUMBER;
 
-    // How often to refresh tail tracker data while in tail tracker mode (seconds).
+    // How often to refresh tail tracker data while the aircraft is airborne (seconds).
     static const unsigned long FETCH_INTERVAL_SECONDS = 60;
+
+    // How often to poll OpenSky while the aircraft is on the ground.
+    // Slower than the airborne rate — position doesn't change and credits are conserved.
+    static const unsigned long OPENSKY_GROUND_FETCH_INTERVAL_SECONDS = 120;
 
     // Minimum time between full matrix redraws in tail mode (avoids String churn /
     // heap fragmentation from repainting at loop() rate; elapsed time on screen

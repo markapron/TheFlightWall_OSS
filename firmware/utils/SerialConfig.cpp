@@ -1,6 +1,7 @@
 #include "SerialConfig.h"
 #include "Secrets.h"
 #include "config/UserConfiguration.h"
+#include "utils/AirportNameCache.h"
 #include <string.h>
 
 // ---------------------------------------------------------------------------
@@ -34,6 +35,31 @@
       uint8_t  brightness;     // 1-100 percent
       uint8_t  nearbyPoolSize; // 1-8 flights
   };
+#endif
+
+// ---------------------------------------------------------------------------
+// Airport name cache flash helpers (SAMD51 only)
+// Defined here so FlashStorage_SAMD.h is only included from one translation
+// unit.  AirportNameCache.cpp calls these via extern declarations.
+// ---------------------------------------------------------------------------
+#if !defined(ARDUINO_ARCH_ESP32)
+static const int kAirportCacheEepromOffset = 256; // after SAMDPersistedConfig
+
+void airportCacheFlashSave(const void *data, size_t len)
+{
+    const uint8_t *src = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < len; ++i)
+        EEPROM.write(kAirportCacheEepromOffset + (int)i, src[i]);
+    EEPROM.commit();
+}
+
+bool airportCacheFlashLoad(void *data, size_t len)
+{
+    uint8_t *dst = static_cast<uint8_t *>(data);
+    for (size_t i = 0; i < len; ++i)
+        dst[i] = EEPROM.read(kAirportCacheEepromOffset + (int)i);
+    return true;
+}
 #endif
 
 namespace SerialConfig
@@ -221,6 +247,7 @@ static void rebootDevice()
 void begin()
 {
     loadPersistedValues();
+    AirportNameCache::begin();
     Serial.println(F("Type 'm' + Enter for the config menu."));
 }
 

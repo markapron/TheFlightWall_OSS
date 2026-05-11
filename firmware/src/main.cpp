@@ -737,8 +737,13 @@ void loop()
     // --- MODE_TAIL_TRACKER: fetch status for the configured tail number ---
     else if (g_appMode == MODE_TAIL_TRACKER)
     {
-        const unsigned long tailIntervalMs =
-            TailTrackerConfiguration::FETCH_INTERVAL_SECONDS * 1000UL;
+        // Use the previous fetch result to pick the poll rate:
+        // airborne → 60 s, on-ground or status unknown → 120 s.
+        const bool knownAirborne = g_tailStatus.actual_off_epoch > 0
+                                && g_tailStatus.actual_on_epoch  == 0;
+        const unsigned long tailIntervalMs = knownAirborne
+            ? TailTrackerConfiguration::FETCH_INTERVAL_SECONDS * 1000UL
+            : TailTrackerConfiguration::OPENSKY_GROUND_FETCH_INTERVAL_SECONDS * 1000UL;
 
         if ((g_lastTailFetchMs == 0 || now - g_lastTailFetchMs >= tailIntervalMs) &&
             WiFi.status() == WL_CONNECTED)

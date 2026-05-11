@@ -10,10 +10,12 @@ Nominatim reverse-geocoding is rate-limited by a distance threshold cache.
 #include <ArduinoJson.h>
 #include <ArduinoHttpClient.h>
 #include "config/APIConfiguration.h"
+#include "config/AirportNameConfiguration.h"
 #include "config/TailTrackerConfiguration.h"
 #include "utils/HttpUtils.h"
 #include "utils/GeoUtils.h"
 #include "utils/MemoryUtils.h"
+#include "utils/AirportNameCache.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,6 +53,7 @@ static String        s_cachedIcao24;          // 6 hex chars; empty = unknown
 static String        s_cachedIdent;
 static String        s_cachedOriginCode;
 static String        s_cachedDestCode;
+static String        s_cachedDestName;   // From AirportNameCache / AeroAPI /airports/{id}
 static double        s_cachedOriginLat = NAN;
 static double        s_cachedOriginLon = NAN;
 static double        s_cachedDestLat   = NAN;
@@ -282,6 +285,84 @@ TailTrackerFetcher::TailTrackerFetcher(OpenSkyFetcher *openSky)
     : _openSky(openSky) {}
 
 // ---------------------------------------------------------------------------
+// fetchAirportInfoForCache — one-time AeroAPI GET /airports/{code} for name+coords
+// ---------------------------------------------------------------------------
+
+static bool fetchAirportInfoForCache(const String &airportCode,
+                                     String &outName, double &outLat, double &outLon)
+{
+    if (airportCode.length() == 0) return false;
+
+    const String url = String(APIConfiguration::AEROAPI_BASE_URL) + "/airports/" + airportCode;
+    bool https = true;
+    String host;
+    uint16_t port = 443;
+    String path;
+    if (!parseUrl(url, https, host, port, path)) return false;
+
+#if defined(FLIGHTWALL_SKIP_TLS)
+    https = false; port = 80;
+#else
+    if (!https) return false;
+#endif
+
+    int    code = -1;
+    String payload;
+
+#if defined(ARDUINO_ARCH_ESP32)
+    {
+        TailTlsClient net;
+#if !defined(FLIGHTWALL_SKIP_TLS)
+        if (APIConfiguration::AEROAPI_INSECURE_TLS) net.setInsecure();
+#endif
+        HttpClient http(net, host.c_str(), port);
+        http.setHttpResponseTimeout(30000);
+        http.beginRequest();
+        http.get(path);
+        http.sendHeader("x-apikey", APIConfiguration::AEROAPI_KEY);
+        http.sendHeader("Accept",   "application/json");
+        http.endRequest();
+        code    = http.responseStatusCode();
+        payload = http.responseBody();
+    }
+#else
+    {
+        const String hdrs = String("x-apikey: ") + APIConfiguration::AEROAPI_KEY
+                          + "\r\nAccept: application/json\r\n";
+        if (!wifiClientRequest("GET", host, port, path, hdrs, "", code, payload))
+            return false;
+    }
+#endif
+
+    if (code != 200) {
+        Serial.print(F("TailTracker: /airports/ HTTP "));
+        Serial.println(code);
+        flightwallStringDrop(payload);
+        return false;
+    }
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    flightwallStringDrop(payload);
+    if (err) { doc.clear(); return false; }
+
+    if (!doc["name"].isNull())
+        outName = doc["name"].as<const char *>();
+
+    outLat = NAN; outLon = NAN;
+    if (!doc["latitude"].isNull())  outLat = doc["latitude"].as<double>();
+    if (!doc["longitude"].isNull()) outLon = doc["longitude"].as<double>();
+    if (isnan(outLat) && !doc["lat"].isNull()) outLat = doc["lat"].as<double>();
+    if (isnan(outLon)) {
+        if (!doc["lon"].isNull()) outLon = doc["lon"].as<double>();
+        if (!doc["lng"].isNull()) outLon = doc["lng"].as<double>();
+    }
+
+    doc.clear();
+    return outName.length() > 0;
+}
+
+// ---------------------------------------------------------------------------
 // fetchRouteFromAeroAPI — called once per flight leg; caches route metadata
 // ---------------------------------------------------------------------------
 
@@ -475,6 +556,7 @@ bool TailTrackerFetcher::fetchRouteFromAeroAPI(const String &ident)
 
     s_cachedOriginCode = "";
     s_cachedDestCode   = "";
+    s_cachedDestName   = "";
     s_cachedOriginLat  = NAN; s_cachedOriginLon = NAN;
     s_cachedDestLat    = NAN; s_cachedDestLon   = NAN;
     s_cachedOriginCity = ""; s_cachedOriginRegion = "";
@@ -513,6 +595,51 @@ bool TailTrackerFetcher::fetchRouteFromAeroAPI(const String &ident)
         } else if (!d["country_code"].isNull()) {
             s_cachedDestRegion = d["country_code"].as<const char *>();
             s_cachedDestRegion.toUpperCase();
+        }
+    }
+
+    // Resolve destination airport display name (three tiers, first hit wins).
+    s_cachedDestName = "";
+    if (s_cachedDestCode.length() > 0) {
+        // 1. Compile-time override — wins unconditionally, no API call.
+        for (int i = 0; i < AirportNameConfiguration::kOverrideCount; ++i) {
+            if (s_cachedDestCode == AirportNameConfiguration::kOverrides[i].code) {
+                s_cachedDestName = AirportNameConfiguration::kOverrides[i].name;
+                Serial.print(F("TailTracker: airport override -> "));
+                Serial.println(s_cachedDestName);
+                break;
+            }
+        }
+        // 2. Persistent cache — no API call.
+        if (s_cachedDestName.length() == 0) {
+            AirportCacheEntry ace;
+            if (AirportNameCache::findByCode(s_cachedDestCode.c_str(), ace))
+                s_cachedDestName = ace.name;
+        }
+        // 3. AeroAPI GET /airports/{code} ($0.015, result stored for future use).
+        if (s_cachedDestName.length() == 0) {
+            String apName;
+            double apLat = NAN, apLon = NAN;
+            if (fetchAirportInfoForCache(s_cachedDestCode, apName, apLat, apLon)) {
+                apName = AirportNameCache::abbreviateName(apName);
+                // Promote coords if the /flights response omitted them.
+                if (!hasPlausibleLatLon(s_cachedDestLat, s_cachedDestLon)
+                        && hasPlausibleLatLon(apLat, apLon)) {
+                    s_cachedDestLat = apLat;
+                    s_cachedDestLon = apLon;
+                }
+                const float storeLat = (float)(hasPlausibleLatLon(s_cachedDestLat, s_cachedDestLon)
+                                               ? s_cachedDestLat : apLat);
+                const float storeLon = (float)(hasPlausibleLatLon(s_cachedDestLat, s_cachedDestLon)
+                                               ? s_cachedDestLon : apLon);
+                AirportNameCache::store(s_cachedDestCode.c_str(), apName.c_str(),
+                                        storeLat, storeLon);
+                s_cachedDestName = apName;
+                Serial.print(F("TailTracker: cached airport name '"));
+                Serial.print(apName);
+                Serial.print(F("' for "));
+                Serial.println(s_cachedDestCode);
+            }
         }
     }
 
@@ -745,6 +872,7 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
     result.status           = s_cachedStatus;
     result.origin_code      = s_cachedOriginCode;
     result.dest_code        = s_cachedDestCode;
+    result.dest_name        = s_cachedDestName;
     result.origin_lat       = s_cachedOriginLat;
     result.origin_lon       = s_cachedOriginLon;
     result.dest_lat         = s_cachedDestLat;
@@ -918,6 +1046,14 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
     // AeroAPI lands set progress to 100.
     if (result.actual_on_epoch > 0 && result.progress_percent == 0)
         result.progress_percent = 100;
+
+    // If landed with no known airport name, search persistent cache by position.
+    if (result.status == "Landed" && result.dest_name.length() == 0
+            && hasPlausibleLatLon(result.lat, result.lon)) {
+        AirportCacheEntry ace;
+        if (AirportNameCache::findNearest(result.lat, result.lon, 5.0, ace))
+            result.dest_name = ace.name;
+    }
 
     result.valid = true;
     out = result;
