@@ -18,8 +18,8 @@ public:
                            double radiusKm,
                            std::vector<StateVector> &outStateVectors) override;
 
-    // Fetch a single aircraft globally by its ICAO24 transponder address (6 hex chars).
-    // Uses ?icao24= query so the response is tiny (≤1 aircraft).
+    // Fetch a single aircraft by its ICAO24 transponder address (6 hex chars).
+    // Uses ?icao24= query so the response is filtered to that aircraft.
     // Returns true and populates outState when the aircraft is found online.
     bool fetchByIcao24(const String &icao24Hex, StateVector &outState);
 
