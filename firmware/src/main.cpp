@@ -717,6 +717,7 @@ void loop()
                     Serial.print(F(" added, "));
                     Serial.print((int)newEnriched);
                     Serial.println(F(" enriched via AeroAPI."));
+                    AeroAPIFetcher::printSpendSummary();
                 }
             }
             flightwallVectorDrop(states);

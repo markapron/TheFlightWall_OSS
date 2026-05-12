@@ -25,4 +25,6 @@ public:
     ~AeroAPIFetcher() override = default;
 
     bool fetchFlightInfo(const String &flightIdent, FlightInfo &outInfo) override;
+
+    static void printSpendSummary();
 };

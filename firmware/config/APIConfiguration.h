@@ -23,4 +23,8 @@ namespace APIConfiguration
     // TLS behavior for external services
     static const bool AEROAPI_INSECURE_TLS = true;
     static const bool FLIGHTWALL_INSECURE_TLS = true;
+
+    // Hard daily budget across all AeroAPI endpoints (millidollars; 1 = $0.001).
+    // Blocks further calls once reached; resets daily. Sized for $5/month.
+    static constexpr uint16_t AEROAPI_DAILY_BUDGET_MILLIDOLLARS = 160; // $0.16/day
 }
