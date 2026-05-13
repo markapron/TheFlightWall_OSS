@@ -46,6 +46,6 @@ namespace TailTrackerConfiguration
 
     // Infer flying when BOTH conditions hold for this many consecutive polls.
     static const int INFER_FLY_CONSECUTIVE  = 2;
-    static const int INFER_FLY_ALT_FT       = 600;  // above 400 ft
+    static const int INFER_FLY_ALT_FT       = 400;  // above 400 ft
     static const int INFER_FLY_SPEED_KT     = 60;   // above 20 kt
 }

@@ -13,6 +13,25 @@ Output: Populates FlightInfo on success and returns true.
 #include "utils/HttpUtils.h"
 #include "utils/MemoryUtils.h"
 
+static uint16_t      s_costFlightCalls  = 0;
+static uint16_t      s_costAirportCalls = 0;
+static unsigned long s_lastResetMs      = 0;
+
+static void maybeDailyReset() {
+    if (millis() - s_lastResetMs >= 86400000UL) {
+        s_costFlightCalls  = 0;
+        s_costAirportCalls = 0;
+        s_lastResetMs      = millis();
+        Serial.println(F("AeroAPI: daily cost window reset"));
+    }
+}
+
+static bool nearbyBudgetExhausted() {
+    const uint32_t spent = (uint32_t)s_costFlightCalls  *  5u
+                         + (uint32_t)s_costAirportCalls * 15u;
+    return spent >= APIConfiguration::AEROAPI_DAILY_BUDGET_MILLIDOLLARS;
+}
+
 static String safeGetString(JsonVariant v, const char *key)
 {
     if (v[key].isNull())
@@ -93,6 +112,12 @@ static bool fetchAirportLatLonFromAeroAPI(const String &airportCode, double &out
         }
     }
 
+    if (nearbyBudgetExhausted()) {
+        Serial.println(F("AeroAPI: daily budget exhausted — skipping /airports/{code}"));
+        outLat = NAN; outLon = NAN;
+        return false;
+    }
+
     const String url = String(APIConfiguration::AEROAPI_BASE_URL) + "/airports/" + airportCode;
     bool https = true;
     String host;
@@ -166,6 +191,7 @@ static bool fetchAirportLatLonFromAeroAPI(const String &airportCode, double &out
 
     doc.clear();
 
+    ++s_costAirportCalls;
     if (s_cache.size() < 48)
     {
         AirportCoordCacheEntry e;
@@ -185,6 +211,11 @@ bool AeroAPIFetcher::fetchFlightInfo(const String &flightIdent, FlightInfo &outI
     if (strlen(APIConfiguration::AEROAPI_KEY) == 0)
     {
         Serial.println("AeroAPIFetcher: No API key configured");
+        return false;
+    }
+    maybeDailyReset();
+    if (nearbyBudgetExhausted()) {
+        Serial.println(F("AeroAPI: daily budget exhausted — skipping /flights/{ident}"));
         return false;
     }
 
@@ -317,5 +348,40 @@ bool AeroAPIFetcher::fetchFlightInfo(const String &flightIdent, FlightInfo &outI
     }
 
     doc.clear();
+    ++s_costFlightCalls;
     return true;
+}
+
+void AeroAPIFetcher::printSpendSummary()
+{
+    const uint32_t totalMd = (uint32_t)s_costFlightCalls  *  5u
+                           + (uint32_t)s_costAirportCalls * 15u;
+    char cbuf[8];
+    Serial.println(F(" AEROAPI SPEND  nearby (today)"));
+    if (s_costFlightCalls > 0) {
+        Serial.print(F("   /flights/{ident}   "));
+        Serial.print(s_costFlightCalls); Serial.print(F(" calls  x $0.005 = $"));
+        snprintf(cbuf, sizeof(cbuf), "%u.%03u", (s_costFlightCalls*5u)/1000u, (s_costFlightCalls*5u)%1000u);
+        Serial.println(cbuf);
+    }
+    if (s_costAirportCalls > 0) {
+        Serial.print(F("   /airports/{code}   "));
+        Serial.print(s_costAirportCalls); Serial.print(F(" calls  x $0.015 = $"));
+        snprintf(cbuf, sizeof(cbuf), "%u.%03u", (s_costAirportCalls*15u)/1000u, (s_costAirportCalls*15u)%1000u);
+        Serial.println(cbuf);
+    }
+    if (s_costFlightCalls == 0 && s_costAirportCalls == 0)
+        Serial.println(F("   (no calls)"));
+    Serial.print(F("                          TOTAL           $"));
+    snprintf(cbuf, sizeof(cbuf), "%u.%03u", (unsigned)(totalMd/1000u), (unsigned)(totalMd%1000u));
+    Serial.println(cbuf);
+    const uint32_t budget = APIConfiguration::AEROAPI_DAILY_BUDGET_MILLIDOLLARS;
+    if (totalMd >= budget) {
+        Serial.println(F("                          BUDGET  EXHAUSTED"));
+    } else {
+        const uint32_t rem = budget - totalMd;
+        snprintf(cbuf, sizeof(cbuf), "%u.%03u", (unsigned)(rem/1000u), (unsigned)(rem%1000u));
+        Serial.print(F("                          BUDGET  $"));
+        Serial.print(cbuf); Serial.println(F(" remaining"));
+    }
 }
