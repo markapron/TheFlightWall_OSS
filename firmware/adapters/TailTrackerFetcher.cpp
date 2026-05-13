@@ -798,8 +798,8 @@ bool TailTrackerFetcher::fetchPositionFromAeroAPI(const String &faFlightId)
 
     s_aeroApiLat      = lpLat;
     s_aeroApiLon      = lpLon;
-    // altitude field in AeroAPI last_position is in feet
-    s_aeroApiAltFt    = lp["altitude"].isNull()    ? 0  : lp["altitude"].as<int>();
+    // altitude in AeroAPI last_position is in flight levels (hundreds of feet)
+    s_aeroApiAltFt    = lp["altitude"].isNull()    ? 0  : lp["altitude"].as<int>() * 100;
     s_aeroApiSpeedKt  = lp["groundspeed"].isNull() ? -1 : lp["groundspeed"].as<int>();
     s_aeroApiPosValid = true;
     ++s_costPosCalls;
@@ -959,7 +959,8 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
 
             // Telemetry inference overrides when primary sources are ambiguous.
             if (s_telemetryOnGround && result.status == "Flying") {
-                result.status = "Landed";
+                result.status  = "Landed";
+                s_cachedStatus = "Landed";
                 if (!s_routeNeedsRefresh) {
                     s_routeNeedsRefresh = true;
                     Serial.println(F("TailTracker: telemetry inference triggered route refresh"));
@@ -1022,9 +1023,7 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
             result.altitude_ft    = s_aeroApiAltFt;
             result.positionSource = TailPositionSource::AeroApi;
             usingAeroApi          = true;
-            // Feed inference from AeroAPI telemetry when it was just refreshed.
-            if (fallbackDue)
-                updateTelemetryInference(s_aeroApiAltFt, s_aeroApiSpeedKt);
+            updateTelemetryInference(s_aeroApiAltFt, s_aeroApiSpeedKt);
         } else if (hasPlausibleLatLon(s_stickyLat, s_stickyLon)) {
             result.lat            = s_stickyLat;
             result.lon            = s_stickyLon;
@@ -1053,7 +1052,7 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
         // when landed; fall back to AeroAPI-supplied strings only if coordinates unknown.
         if (usingAeroApi) {
             fetchReverseGeocode(s_aeroApiLat, s_aeroApiLon, result.city, result.region);
-        } else if (result.actual_on_epoch > 0) {
+        } else if (result.actual_on_epoch > 0 || result.status == "Landed") {
             if (hasPlausibleLatLon(s_cachedDestLat, s_cachedDestLon))
                 fetchReverseGeocode(s_cachedDestLat, s_cachedDestLon, result.city, result.region);
             else {
@@ -1066,8 +1065,19 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
         }
     }
 
-    // AeroAPI lands set progress to 100.
-    if (result.actual_on_epoch > 0 && result.progress_percent == 0)
+    // Apply telemetry inference to status when OpenSky position is unavailable.
+    if (s_telemetryOnGround && result.status == "Flying") {
+        result.status  = "Landed";
+        s_cachedStatus = "Landed";
+        s_wasAirborne  = false;
+        if (!s_routeNeedsRefresh) {
+            s_routeNeedsRefresh = true;
+            Serial.println(F("TailTracker: telemetry inference triggered route refresh (no OpenSky)"));
+        }
+    }
+
+    // Force progress to 100% in all landed states.
+    if (result.actual_on_epoch > 0 || result.status == "Landed")
         result.progress_percent = 100;
 
     // If landed with no known airport name, search persistent cache by position.

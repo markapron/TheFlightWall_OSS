@@ -422,7 +422,7 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status, uint
     // destination airport; (0,0) is a "no fix" placeholder from AeroAPI.
     const bool hasPosition = !isnan(status.lat) && !isnan(status.lon)
                              && !(status.lat == 0.0 && status.lon == 0.0);
-    bool isLanded   = status.actual_on_epoch  > 0;
+    bool isLanded   = status.actual_on_epoch > 0 || status.status == "Landed";
     bool isAirborne = status.actual_off_epoch > 0 && !isLanded;
 
     const bool hasArrivalFix = isLanded
@@ -538,7 +538,7 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status, uint
     }
     else
     {
-        if (isLanded && currentEpoch >= status.actual_on_epoch)
+        if (isLanded && status.actual_on_epoch > 0 && currentEpoch >= status.actual_on_epoch)
             timeLine = formatElapsed(currentEpoch - status.actual_on_epoch, true);
         else if (isAirborne && currentEpoch >= status.actual_off_epoch)
             timeLine = formatElapsed(currentEpoch - status.actual_off_epoch, false);
