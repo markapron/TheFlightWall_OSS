@@ -529,7 +529,12 @@ bool TailTrackerFetcher::fetchRouteFromAeroAPI(const String &ident)
 
         if (bestAfterLand >= 0) {
             bestIdx = bestAfterLand;
-        } else {
+        } else if (nowEpoch > 0) {
+            // Only run the closest-to-now fallback when the clock is valid.
+            // With nowEpoch==0, d = ep - 0 = ep, so the oldest leg would win
+            // (smallest Unix timestamp), which is the opposite of what we want.
+            // When the clock is invalid, leave bestIdx=0 — AeroAPI returns legs
+            // in descending chronological order so index 0 is always the most recent.
             unsigned long bestDiff = ULONG_MAX;
             for (size_t i = 0; i < flights.size(); ++i) {
                 unsigned long minDiff = ULONG_MAX;
@@ -631,8 +636,14 @@ bool TailTrackerFetcher::fetchRouteFromAeroAPI(const String &ident)
         // 2. Persistent cache — no API call.
         if (s_cachedDestName.length() == 0) {
             AirportCacheEntry ace;
-            if (AirportNameCache::findByCode(s_cachedDestCode.c_str(), ace))
+            if (AirportNameCache::findByCode(s_cachedDestCode.c_str(), ace)) {
                 s_cachedDestName = ace.name;
+                if (!hasPlausibleLatLon(s_cachedDestLat, s_cachedDestLon)
+                        && hasPlausibleLatLon((double)ace.lat, (double)ace.lon)) {
+                    s_cachedDestLat = ace.lat;
+                    s_cachedDestLon = ace.lon;
+                }
+            }
         }
         // 3. AeroAPI GET /airports/{code} ($0.015, result stored for future use).
         if (s_cachedDestName.length() == 0) {
@@ -941,6 +952,30 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
             const bool wasAirborne = s_wasAirborne;
             if (!sv.on_ground) {
                 result.status    = "Flying";
+                if (!wasAirborne) {
+                    // Ground → air transition: fetch new leg immediately so the
+                    // correct destination is shown this cycle, not the next poll.
+                    s_cachedActualOn = 0;
+                    Serial.println(F("TailTracker: takeoff detected via OpenSky"));
+                    if (fetchRouteFromAeroAPI(ident)) {
+                        s_routeFetchMs      = nowMs;
+                        s_routeNeedsRefresh = false;
+                        result.ident               = s_cachedIdent;
+                        result.origin_code         = s_cachedOriginCode;
+                        result.dest_code           = s_cachedDestCode;
+                        result.dest_name           = s_cachedDestName;
+                        result.origin_lat          = s_cachedOriginLat;
+                        result.origin_lon          = s_cachedOriginLon;
+                        result.dest_lat            = s_cachedDestLat;
+                        result.dest_lon            = s_cachedDestLon;
+                        result.actual_off_epoch    = s_cachedActualOff;
+                        result.actual_on_epoch     = 0;
+                        result.scheduled_off_epoch = s_cachedScheduledOff;
+                        result.progress_percent    = 0;
+                    } else {
+                        s_routeNeedsRefresh = true;
+                    }
+                }
                 s_wasAirborne    = true;
                 result.actual_on_epoch = 0; // not yet landed
             } else {
@@ -969,6 +1004,11 @@ bool TailTrackerFetcher::fetchStatus(const String &ident, TailFlightStatus &out,
                        && result.actual_on_epoch == 0) {
                 result.status = "Flying";
                 s_wasAirborne = true;
+                if (!s_routeNeedsRefresh) {
+                    s_routeNeedsRefresh = true;
+                    s_cachedActualOn    = 0;
+                    Serial.println(F("TailTracker: takeoff inferred via telemetry — route refresh triggered"));
+                }
             }
 
             // Update sticky position.

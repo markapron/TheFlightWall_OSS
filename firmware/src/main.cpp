@@ -496,6 +496,8 @@ void setup()
         while (WiFi.status() != WL_CONNECTED && attempts < 150) // ~30 s
         {
             delay(200);
+            checkButtons();
+            if (g_appMode == MODE_SERIAL_CONFIG) break;
             const int st = (int)WiFi.status();
             if (st != lastStatus)
             {
@@ -518,14 +520,28 @@ void setup()
             String ipStr = String(ip[0]) + "." + String(ip[1]) + "."
                          + String(ip[2]) + "." + String(ip[3]);
             g_display.displayMessage(String("WiFi OK ") + ipStr);
+#if !defined(ARDUINO_ARCH_ESP32)
+            {
+                int ntpAttempts = 0;
+                while (WiFi.getTime() == 0 && ntpAttempts < 25) // up to ~5 s
+                {
+                    delay(200);
+                    ntpAttempts++;
+                }
+                if (WiFi.getTime() == 0)
+                    Serial.println(F("WiFi: NTP sync timed out; clock may be invalid"));
+                else
+                    Serial.println(F("WiFi: NTP sync OK"));
+            }
+#endif
             delay(3000);
             g_display.showLoading();
         }
-        else
+        else if (g_appMode != MODE_SERIAL_CONFIG)
         {
             Serial.print("WiFi not connected; proceeding without network. Final status=");
             Serial.println((int)WiFi.status());
-            g_display.displayMessage(String("WiFi FAIL"));
+            g_display.displayMessage(String("WiFi FAIL - DOWN x3 Config"));
         }
     }
 
@@ -641,6 +657,7 @@ void loop()
                 g_lastMemLogMs     = 0;
             }
             Serial.println(F("Serial config closed — resuming normal operation."));
+            forceWifiReconnect(F("credentials updated"));
         }
         delay(10);
         return;

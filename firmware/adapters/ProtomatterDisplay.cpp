@@ -431,7 +431,20 @@ void ProtomatterDisplay::displayTailTracker(const TailFlightStatus &status, uint
 
     double bearingDeg  = 0.0;
     float  distanceMi  = 0.0f;
-    if (hasPosition)
+    if (isLanded && hasArrivalFix)
+    {
+        // When landed, prefer destination airport coords over aircraft position.
+        // The aircraft position may be a stale sticky reading from before the
+        // current leg, which would point the compass at the previous airport.
+        const double distKm = haversineKm(
+            UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+            status.dest_lat, status.dest_lon);
+        distanceMi = (float)(distKm * 0.621371);
+        bearingDeg = computeBearingDeg(
+            UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
+            status.dest_lat, status.dest_lon);
+    }
+    else if (hasPosition)
     {
         const double distKm = haversineKm(
             UserConfiguration::CENTER_LAT, UserConfiguration::CENTER_LON,
